@@ -1,0 +1,92 @@
+{
+  "name": "yeetful",
+  "version": "0.1.0",
+  "description": "Drop-in x402 payments for APIs and clients. Gate routes behind stablecoin micropayments in a few lines.",
+  "keywords": [
+    "x402",
+    "payments",
+    "stablecoin",
+    "usdc",
+    "micropayments",
+    "http-402",
+    "next",
+    "express",
+    "viem",
+    "yeetful"
+  ],
+  "homepage": "https://yeetful.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yeetful/yeetful.git",
+    "directory": "sdk"
+  },
+  "license": "MIT",
+  "author": "Yeetful",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "require": "./dist/client.cjs"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js",
+      "require": "./dist/server.cjs"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "import": "./dist/next.js",
+      "require": "./dist/next.cjs"
+    },
+    "./express": {
+      "types": "./dist/express.d.ts",
+      "import": "./dist/express.js",
+      "require": "./dist/express.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "viem": "^2.21.0"
+  },
+  "peerDependenciesMeta": {
+    "viem": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "express": "^4.19.2",
+    "next": "^15.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "viem": "^2.21.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
