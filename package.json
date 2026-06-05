@@ -1,9 +1,13 @@
 {
   "name": "yeetful",
-  "version": "0.1.0",
-  "description": "Drop-in x402 payments for APIs and clients. Gate routes behind stablecoin micropayments in a few lines.",
+  "version": "0.2.0",
+  "description": "Spend-controlled x402 for AI agents. Give an agent an expense account — an allowlist + per-call/per-day budget — and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers.",
   "keywords": [
     "x402",
+    "ai-agents",
+    "agent-payments",
+    "spend-limit",
+    "expense-account",
     "payments",
     "stablecoin",
     "usdc",
@@ -17,8 +21,7 @@
   "homepage": "https://yeetful.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yeetful/yeetful.git",
-    "directory": "sdk"
+    "url": "git+https://github.com/Yeetful/sdk.git"
   },
   "license": "MIT",
   "author": "Yeetful",
@@ -31,6 +34,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./agent": {
+      "types": "./dist/agent.d.ts",
+      "import": "./dist/agent.js",
+      "require": "./dist/agent.cjs"
     },
     "./client": {
       "types": "./dist/client.d.ts",
@@ -56,6 +64,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

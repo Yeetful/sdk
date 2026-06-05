@@ -1,10 +1,57 @@
 # yeetful
 
-**Drop-in [x402](https://www.x402.org) payments for your APIs and clients.** Gate any HTTP route behind a stablecoin micropayment in a few lines — no accounts, no API keys, no webhooks. Built for [Yeetful](https://yeetful.com), MIT-licensed, works anywhere TypeScript does.
+**Spend-controlled [x402](https://www.x402.org) for AI agents.** Give an agent an *expense account* — an allowlist of endpoints plus per-call / per-day budgets — and let it pay any x402 service with no API keys. Enforcement is local and instant; every call emits a receipt. Built for [Yeetful](https://yeetful.com), MIT-licensed, works anywhere TypeScript does.
 
 ```bash
 npm install yeetful viem
 ```
+
+## Agent expense account
+
+Wrap your agent's calls in one grant-aware `pay()`. It refuses anything off the allowlist or over budget **before** signing a payment — your guardrail against runaway loops, bugs, and prompt-injected tool calls.
+
+```ts
+import { yeetful, GrantError } from 'yeetful/agent'
+import { createWalletClient, http } from 'viem'
+import { base } from 'viem/chains'
+import { privateKeyToAccount } from 'viem/accounts'
+
+const wallet = createWalletClient({
+  account: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
+  chain: base,
+  transport: http(),
+})
+
+const pay = yeetful({
+  wallet,
+  grant: {
+    allow: ['tripadvisor.x402.paysponge.com', 'anthropic.yeetful.com'],
+    perCallUsd: 0.05,
+    perDayUsd: 2,
+    expiresAt: '2026-12-31',
+  },
+  onReceipt: (r) => console.log(r.host, `$${r.amountUsd}`, r.txHash ?? r.note),
+})
+
+try {
+  const res = await pay('https://tripadvisor.x402.paysponge.com/api/v1/location/search?searchQuery=tokyo')
+  console.log(await res.json())
+  console.log(`spent today: $${pay.spentTodayUsd()} / left: $${pay.remainingTodayUsd()}`)
+} catch (e) {
+  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED
+  if (e instanceof GrantError) console.error(`blocked: ${e.code}`)
+}
+```
+
+One grant authorizes **many** endpoints (the allowlist). Use `onReceipt` to stream the audit trail to your dashboard or the Yeetful control plane.
+
+> **Local vs. hard enforcement.** This SDK enforces the grant in-process — ideal for governing *your own* agents (runaway loops, bugs, injected tool calls). For adversarial guarantees, back the grant with an on-chain Coinbase **Spend Permission** so the wallet contract caps spend regardless of the SDK.
+
+---
+
+## Low-level x402 primitives
+
+The agent wrapper is built on a full x402 toolkit you can use directly:
 
 ```ts
 // Server — gate a route for 1¢ USDC
@@ -17,17 +64,8 @@ export const GET = withPayment(
 ```
 
 ```ts
-// Client — auto-pay when a server returns 402
+// Client — auto-pay when a server returns 402 (no grant enforcement)
 import { createPaymentClient } from 'yeetful/client'
-import { createWalletClient, http } from 'viem'
-import { base } from 'viem/chains'
-import { privateKeyToAccount } from 'viem/accounts'
-
-const wallet = createWalletClient({
-  account: privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`),
-  chain: base,
-  transport: http(),
-})
 
 const pay = createPaymentClient({ wallet })
 const res = await pay('https://api.example.com/premium')

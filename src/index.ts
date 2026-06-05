@@ -1,14 +1,18 @@
 /**
- * Yeetful — drop-in x402 payments for APIs and clients.
+ * Yeetful — spend-controlled x402 for AI agents.
  *
  * Top-level entry re-exports the most common primitives. Use the subpath
- * entries for framework-specific helpers:
+ * entries for the agent expense account and framework-specific helpers:
  *
- *   - `yeetful/client`  → client-side fetch wrapper
+ *   - `yeetful/agent`   → grant-aware `yeetful()` paid fetch (the expense account)
+ *   - `yeetful/client`  → low-level client-side fetch wrapper
  *   - `yeetful/server`  → runtime-agnostic `gate()`
  *   - `yeetful/next`    → Next.js App Router `withPayment()`
  *   - `yeetful/express` → Express `paymentRequired()` middleware
  */
+
+export { yeetful, GrantError } from './agent.js'
+export type { AgentOptions, GrantPolicy, GrantViolation, Receipt, PayFn } from './agent.js'
 
 export { createPaymentClient, signPayment, PaymentError } from './client.js'
 export type { ClientOptions } from './client.js'

@@ -3,6 +3,7 @@ import { defineConfig } from 'tsup'
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
+    agent: 'src/agent.ts',
     client: 'src/client.ts',
     server: 'src/server.ts',
     next: 'src/next.ts',
