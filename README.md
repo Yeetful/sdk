@@ -45,6 +45,22 @@ try {
 
 One grant authorizes **many** endpoints (the allowlist). Use `onReceipt` to stream the audit trail to your dashboard or the Yeetful control plane.
 
+### Hosted-ledger sync
+
+Mirror a grant you created at [yeetful.com](https://yeetful.com) and pass an API key (minted on the dashboard) — every receipt then syncs to your hosted ledger, so budgets and the audit feed include this agent's calls:
+
+```ts
+const pay = yeetful({
+  wallet,
+  grant: { id: 'your-grant-id', allow: [...], perCallUsd: 0.05, perDayUsd: 2 },
+  apiKey: process.env.YEETFUL_API_KEY, // yf_…
+})
+// …
+await pay.flushLedger() // before a short-lived script exits
+```
+
+Sync is best-effort and never blocks or fails a payment; denials are synced too (`ok: false` with the violation code).
+
 > **Local vs. hard enforcement.** This SDK enforces the grant in-process — ideal for governing *your own* agents (runaway loops, bugs, injected tool calls). For adversarial guarantees, back the grant with an on-chain Coinbase **Spend Permission** so the wallet contract caps spend regardless of the SDK.
 
 ---
