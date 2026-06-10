@@ -19,11 +19,13 @@
  * const pay = yeetful({
  *   wallet,                                   // viem WalletClient
  *   grant: {
+ *     id: 'cmbq…',                            // hosted grant id (yeetful.com)
  *     allow: ['tripadvisor.x402.paysponge.com', 'anthropic.yeetful.com'],
  *     perCallUsd: 0.05,
  *     perDayUsd: 2,
  *     expiresAt: '2026-12-31',
  *   },
+ *   apiKey: process.env.YEETFUL_API_KEY,      // yf_… → receipts sync to your dashboard
  *   onReceipt: (r) => console.log(r.host, r.amountUsd, r.txHash),
  * })
  *
@@ -94,6 +96,16 @@ export interface AgentOptions {
   onReceipt?: (receipt: Receipt) => void | Promise<void>
   /** Human-readable progress logging. */
   onEvent?: (message: string) => void
+  /**
+   * Yeetful API key (`yf_…`, minted at yeetful.com while signed in). Together
+   * with `grant.id` it turns on hosted-ledger sync: every receipt is POSTed to
+   * `{ledgerUrl}/api/grants/{grant.id}/ledger` with Bearer auth, so the
+   * dashboard's budgets/audit trail include this agent's calls. Sync is
+   * best-effort and never blocks or fails a payment.
+   */
+  apiKey?: string
+  /** Base URL of the hosted ledger. Defaults to https://yeetful.com. */
+  ledgerUrl?: string
 }
 
 export interface PayFn {
@@ -104,6 +116,12 @@ export interface PayFn {
   remainingTodayUsd(): number
   /** USD spent over the life of this client instance. */
   spentTotalUsd(): number
+  /**
+   * Resolves once every hosted-ledger sync issued so far has settled (no-op
+   * without `apiKey`). Await this before a short-lived script exits so the
+   * last receipts aren't dropped with the process.
+   */
+  flushLedger(): Promise<void>
 }
 
 function expiryMs(expiresAt: GrantPolicy['expiresAt']): number {
@@ -150,7 +168,45 @@ export function yeetful(options: AgentOptions): PayFn {
   let spentTotal = 0
   let dayIndex = utcDayIndex(Date.now())
 
+  // ── Hosted-ledger sync (optional): receipts → POST /api/grants/:id/ledger ──
+  const ledgerEndpoint =
+    options.apiKey && grant.id
+      ? `${(options.ledgerUrl ?? 'https://yeetful.com').replace(/\/+$/, '')}/api/grants/${grant.id}/ledger`
+      : null
+  if (options.apiKey && !grant.id) {
+    log('hosted-ledger sync disabled: grant.id is not set (use the id of your yeetful.com grant)')
+  }
+  // A chain (not fire-and-forget) so receipts land in order and flushLedger()
+  // can await them; one failed POST is logged and never poisons the chain.
+  let ledgerChain: Promise<void> = Promise.resolve()
+  const ledgerFetch = options.fetch ?? globalThis.fetch
+  const sync = (r: Receipt) => {
+    if (!ledgerEndpoint) return
+    ledgerChain = ledgerChain
+      .then(async () => {
+        const res = await ledgerFetch(ledgerEndpoint, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${options.apiKey}`,
+          },
+          body: JSON.stringify({
+            host: r.host,
+            amountUsd: r.amountUsd,
+            ok: r.ok,
+            txHash: r.txHash,
+            note: r.note,
+          }),
+        })
+        if (!res.ok) log(`ledger sync → ${res.status} for ${r.host}`)
+      })
+      .catch((err) => {
+        log(`ledger sync failed for ${r.host}: ${err instanceof Error ? err.message : err}`)
+      })
+  }
+
   const emit = (r: Receipt) => {
+    sync(r)
     void Promise.resolve(onReceipt?.(r)).catch(() => {})
   }
   const deny = (host: string, code: GrantViolation, msg: string): never => {
@@ -229,5 +285,6 @@ export function yeetful(options: AgentOptions): PayFn {
   pay.spentTodayUsd = () => spentToday
   pay.remainingTodayUsd = () => Math.max(0, grant.perDayUsd - spentToday)
   pay.spentTotalUsd = () => spentTotal
+  pay.flushLedger = () => ledgerChain
   return pay
 }

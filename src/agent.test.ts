@@ -112,3 +112,118 @@ describe('yeetful/agent', () => {
     expect(e.code).toBe('NOT_ALLOWED')
   })
 })
+
+describe('hosted-ledger sync', () => {
+  const LEDGER = 'https://yeetful.test'
+  const KEY = 'yf_' + 'a'.repeat(64)
+
+  /** Delegates paid-host calls to mockFetch; captures ledger POSTs → 201. */
+  function withLedger(payFetch: typeof fetch) {
+    const posts: { url: string; auth: string | null; body: Record<string, unknown> }[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.startsWith(LEDGER)) {
+        posts.push({
+          url,
+          auth: new Headers(init?.headers).get('authorization'),
+          body: JSON.parse(String(init?.body)),
+        })
+        return new Response(JSON.stringify({ id: 'led_1' }), { status: 201 })
+      }
+      return payFetch(input, init)
+    }) as typeof fetch
+    return { fn, posts }
+  }
+
+  it('POSTs settled receipts to the grant ledger with Bearer auth', async () => {
+    const f = mockFetch('10000') // $0.01
+    const l = withLedger(f.fn)
+    const pay = yeetful({
+      wallet,
+      grant: grant({ id: 'grant123' }),
+      fetch: l.fn,
+      apiKey: KEY,
+      ledgerUrl: LEDGER,
+    })
+    await pay(URL_OK)
+    await pay.flushLedger()
+
+    expect(l.posts).toHaveLength(1)
+    expect(l.posts[0]!.url).toBe(`${LEDGER}/api/grants/grant123/ledger`)
+    expect(l.posts[0]!.auth).toBe(`Bearer ${KEY}`)
+    expect(l.posts[0]!.body).toMatchObject({
+      host: HOST,
+      amountUsd: 0.01,
+      ok: true,
+      txHash: '0xabc',
+      note: 'settled',
+    })
+  })
+
+  it('syncs denials too (the audit trail includes refusals)', async () => {
+    const f = mockFetch()
+    const l = withLedger(f.fn)
+    const pay = yeetful({
+      wallet,
+      grant: grant({ id: 'grant123' }),
+      fetch: l.fn,
+      apiKey: KEY,
+      ledgerUrl: LEDGER,
+    })
+    await expect(pay('https://evil.com/x')).rejects.toMatchObject({ code: 'NOT_ALLOWED' })
+    await pay.flushLedger()
+
+    expect(l.posts).toHaveLength(1)
+    expect(l.posts[0]!.body).toMatchObject({ host: 'evil.com', amountUsd: 0, ok: false, note: 'NOT_ALLOWED' })
+  })
+
+  it('does not sync without apiKey or grant.id; flushLedger is a no-op', async () => {
+    const f = mockFetch('10000')
+    const l = withLedger(f.fn)
+    const noKey = yeetful({ wallet, grant: grant({ id: 'grant123' }), fetch: l.fn, ledgerUrl: LEDGER })
+    await noKey(URL_OK)
+    await noKey.flushLedger()
+
+    const warned: string[] = []
+    const noId = yeetful({
+      wallet,
+      grant: grant(),
+      fetch: l.fn,
+      apiKey: KEY,
+      ledgerUrl: LEDGER,
+      onEvent: (m) => { warned.push(m) },
+    })
+    await noId(URL_OK)
+    await noId.flushLedger()
+
+    expect(l.posts).toHaveLength(0)
+    expect(warned.some((m) => m.includes('grant.id'))).toBe(true)
+  })
+
+  it('a failing ledger endpoint never breaks payments or later syncs', async () => {
+    const f = mockFetch('10000')
+    let failures = 0
+    const flaky = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.startsWith(LEDGER)) {
+        failures++
+        if (failures === 1) throw new Error('network down')
+        return new Response('{}', { status: 201 })
+      }
+      return f.fn(input, init)
+    }) as typeof fetch
+    const pay = yeetful({
+      wallet,
+      grant: grant({ id: 'grant123' }),
+      fetch: flaky,
+      apiKey: KEY,
+      ledgerUrl: LEDGER,
+    })
+    const r1 = await pay(URL_OK) // sync throws — payment unaffected
+    const r2 = await pay(URL_OK) // chain recovered, second sync lands
+    await pay.flushLedger()
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(200)
+    expect(failures).toBe(2)
+  })
+})
