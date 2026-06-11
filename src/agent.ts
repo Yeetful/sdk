@@ -35,7 +35,7 @@
  */
 
 import type { WalletClient } from 'viem'
-import { createPaymentClient, PaymentError } from './client.js'
+import { createPaymentClient, PaymentError, requirementAtomicAmount } from './client.js'
 import { decodePayment } from './utils.js'
 import type { PaymentRequirement, SettleResult, X402Network } from './types.js'
 
@@ -145,9 +145,10 @@ function hostOf(input: string | URL | Request): string {
   }
 }
 
-/** Pull the settlement tx hash from the X-PAYMENT-RESPONSE header, if present. */
+/** Pull the settlement tx hash from the settle header, if present
+ * (`PAYMENT-RESPONSE` on x402 v2, `X-PAYMENT-RESPONSE` on v1). */
 function txHashOf(res: Response): string | undefined {
-  const header = res.headers.get('x-payment-response')
+  const header = res.headers.get('payment-response') ?? res.headers.get('x-payment-response')
   if (!header) return undefined
   try {
     return decodePayment<SettleResult>(header).transaction
@@ -245,7 +246,9 @@ export function yeetful(options: AgentOptions): PayFn {
       // Per-call enforcement lives in the hook (not maxAmountAtomic) so an
       // over-cap call surfaces a clean GrantError instead of a filtered no-match.
       onPaymentRequired: (req: PaymentRequirement) => {
-        const price = Number(req.maxAmountRequired) / 1e6
+        // Version-agnostic price (v2 `amount`, v1 `maxAmountRequired`).
+        // Selection already dropped unpriced entries, so this can't be null.
+        const price = Number(requirementAtomicAmount(req) ?? 0n) / 1e6
         if (price > grant.perCallUsd) {
           deny(host, 'OVER_PER_CALL', `$${price.toFixed(4)} exceeds per-call cap $${grant.perCallUsd}`)
         }

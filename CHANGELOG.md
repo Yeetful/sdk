@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1
+
+- **Fix: x402 v2 challenges crashed the client** (`TypeError: Cannot convert
+  undefined to a BigInt`). Gateways that moved to protocol v2 — e.g.
+  TripAdvisor's paysponge gateway — price in `amount` (not v1's
+  `maxAmountRequired`), use CAIP-2 network ids (`eip155:8453`, not `base`),
+  and expect the payment back in a `PAYMENT-SIGNATURE` envelope (not
+  `X-PAYMENT`). The client now reads both protocol versions and replies in
+  the version the challenge declared; v1 behavior is unchanged.
+- Requirement selection skips entries this client can't sign (non-EVM
+  networks such as `solana:…`, entries with no parseable amount) instead of
+  crashing; an unpayable challenge raises a clean `PaymentError` and the
+  agent receipts it as `payment-failed`.
+- Settlement tx hashes are read from v2's `payment-response` header as well
+  as v1's `x-payment-response`; v2 discovery docs are also parsed from the
+  `payment-required` response header when the body isn't JSON.
+- New exports: `requirementAtomicAmount()` (version-agnostic price reader),
+  `signExactAuthorization()` (bare EIP-3009 payload), and the
+  `PaymentEnvelopeV2` type.
+
 ## 0.3.0
 
 - **New: hosted-ledger sync.** `yeetful({ wallet, grant, apiKey, ledgerUrl? })` —

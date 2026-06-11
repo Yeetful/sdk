@@ -1,11 +1,13 @@
 import type { Address, Hex, WalletClient } from 'viem'
 import type {
+  ExactEvmPayload,
+  PaymentEnvelopeV2,
   PaymentPayload,
   PaymentRequiredResponse,
   PaymentRequirement,
   X402Network,
 } from './types.js'
-import { encodePayment, randomNonce } from './utils.js'
+import { decodePayment, encodePayment, randomNonce } from './utils.js'
 
 export interface ClientOptions {
   /** A viem WalletClient able to sign EIP-712 typed data. */
@@ -24,11 +26,13 @@ export interface ClientOptions {
 }
 
 /**
- * Create a fetch wrapper that transparently handles x402 payments.
+ * Create a fetch wrapper that transparently handles x402 payments —
+ * protocol v1 ("base" networks, `maxAmountRequired`, `X-PAYMENT` header)
+ * and v2 (CAIP-2 networks, `amount`, `PAYMENT-SIGNATURE` envelope) alike.
  *
  * On a 402 response, it picks the cheapest acceptable requirement,
  * signs an EIP-3009 authorization with the provided wallet, and retries
- * the request with an `X-PAYMENT` header.
+ * the request with the version-appropriate payment header.
  *
  * @example
  * ```ts
@@ -47,7 +51,7 @@ export function createPaymentClient(options: ClientOptions) {
     if (first.status !== 402) return first
 
     const requirements = await parsePaymentRequired(first)
-    const requirement = selectRequirement(requirements.accepts, options)
+    const requirement = selectRequirement(requirements.accepts ?? [], options)
     if (!requirement) {
       throw new PaymentError('No acceptable payment requirement matched client constraints', requirements)
     }
@@ -57,9 +61,10 @@ export function createPaymentClient(options: ClientOptions) {
       if (!approved) throw new PaymentError('Payment rejected by user', requirements)
     }
 
-    const payment = await signPayment(options.wallet, requirement)
+    const payload = await signExactAuthorization(options.wallet, requirement)
+    const header = buildPaymentHeader(requirements, requirement, payload)
     const headers = new Headers(init.headers)
-    headers.set('X-PAYMENT', encodePayment(payment))
+    headers.set(header.name, header.value)
 
     return baseFetch(input, { ...init, headers })
   }
@@ -74,10 +79,35 @@ export class PaymentError extends Error {
   }
 }
 
+/**
+ * Atomic units owed for a requirement, version-agnostic: x402 v2 prices in
+ * `amount`, v1 in `maxAmountRequired`. Returns null when absent or
+ * unparseable (never throws — selection must be able to skip bad entries).
+ */
+export function requirementAtomicAmount(req: PaymentRequirement): bigint | null {
+  const raw = req.amount ?? req.maxAmountRequired
+  if (raw == null) return null
+  try {
+    return BigInt(raw)
+  } catch {
+    return null
+  }
+}
+
 async function parsePaymentRequired(res: Response): Promise<PaymentRequiredResponse> {
   try {
     return (await res.clone().json()) as PaymentRequiredResponse
   } catch {
+    // v2 servers mirror the discovery document base64-encoded in the
+    // `payment-required` response header — fall back to it for non-JSON bodies.
+    const header = res.headers.get('payment-required')
+    if (header) {
+      try {
+        return decodePayment<PaymentRequiredResponse>(header)
+      } catch {
+        /* fall through to the error below */
+      }
+    }
     throw new PaymentError('402 response did not contain a valid x402 discovery body')
   }
 }
@@ -86,23 +116,64 @@ function selectRequirement(
   accepts: PaymentRequirement[],
   opts: ClientOptions,
 ): PaymentRequirement | undefined {
-  const filtered = accepts
+  const priced = accepts
     .filter((a) => a.scheme === 'exact')
-    .filter((a) => !opts.allowedNetworks || opts.allowedNetworks.includes(a.network))
-    .filter((a) => !opts.maxAmountAtomic || BigInt(a.maxAmountRequired) <= opts.maxAmountAtomic)
+    // Only EVM networks this client can sign for (drops e.g. "solana:…").
+    .filter((a) => chainIdForNetwork(a.network) !== null)
+    .filter(
+      (a) =>
+        !opts.allowedNetworks ||
+        opts.allowedNetworks.some((n) => chainIdForNetwork(n) === chainIdForNetwork(a.network)),
+    )
+    .map((a) => ({ req: a, amount: requirementAtomicAmount(a) }))
+    .filter((e): e is { req: PaymentRequirement; amount: bigint } => e.amount !== null)
+    .filter((e) => !opts.maxAmountAtomic || e.amount <= opts.maxAmountAtomic)
 
-  return filtered.sort((a, b) =>
-    BigInt(a.maxAmountRequired) < BigInt(b.maxAmountRequired) ? -1 : 1,
-  )[0]
+  return priced.sort((a, b) => (a.amount < b.amount ? -1 : 1))[0]?.req
+}
+
+/** Build the version-appropriate payment header for a signed authorization. */
+function buildPaymentHeader(
+  challenge: PaymentRequiredResponse,
+  requirement: PaymentRequirement,
+  payload: ExactEvmPayload,
+): { name: string; value: string } {
+  const version = challenge.x402Version ?? 1
+  if (version >= 2) {
+    const envelope: PaymentEnvelopeV2 = {
+      x402Version: version,
+      resource: challenge.resource,
+      accepted: requirement,
+      payload,
+      extensions: challenge.extensions ?? {},
+    }
+    return { name: 'PAYMENT-SIGNATURE', value: encodePayment(envelope) }
+  }
+  const v1: PaymentPayload = {
+    x402Version: 1,
+    scheme: 'exact',
+    network: requirement.network,
+    payload,
+  }
+  return { name: 'X-PAYMENT', value: encodePayment(v1) }
 }
 
 /** Sign an EIP-3009 `TransferWithAuthorization` for the given requirement. */
-export async function signPayment(
+export async function signExactAuthorization(
   wallet: WalletClient,
   requirement: PaymentRequirement,
-): Promise<PaymentPayload> {
+): Promise<ExactEvmPayload> {
   const account = wallet.account
   if (!account) throw new PaymentError('Wallet has no account attached')
+
+  const value = requirementAtomicAmount(requirement)
+  if (value === null) {
+    throw new PaymentError('x402 requirement is missing a payment amount')
+  }
+  const chainId = chainIdForNetwork(requirement.network)
+  if (chainId === null) {
+    throw new PaymentError(`Unsupported x402 network: ${requirement.network}`)
+  }
 
   const now = Math.floor(Date.now() / 1000)
   const validAfter = BigInt(now - 60)
@@ -119,7 +190,7 @@ export async function signPayment(
     domain: {
       name: tokenName,
       version: tokenVersion,
-      chainId: chainIdForNetwork(requirement.network),
+      chainId,
       verifyingContract: requirement.asset,
     },
     types: {
@@ -136,7 +207,7 @@ export async function signPayment(
     message: {
       from: account.address as Address,
       to: requirement.payTo,
-      value: BigInt(requirement.maxAmountRequired),
+      value,
       validAfter,
       validBefore,
       nonce,
@@ -144,25 +215,41 @@ export async function signPayment(
   })) as Hex
 
   return {
-    x402Version: 1,
-    scheme: 'exact',
-    network: requirement.network,
-    payload: {
-      signature,
-      authorization: {
-        from: account.address as Address,
-        to: requirement.payTo,
-        value: requirement.maxAmountRequired,
-        validAfter: validAfter.toString(),
-        validBefore: validBefore.toString(),
-        nonce,
-      },
+    signature,
+    authorization: {
+      from: account.address as Address,
+      to: requirement.payTo,
+      value: value.toString(),
+      validAfter: validAfter.toString(),
+      validBefore: validBefore.toString(),
+      nonce,
     },
   }
 }
 
-function chainIdForNetwork(network: X402Network): number {
-  switch (network) {
+/**
+ * Sign a requirement into the x402 **v1** `X-PAYMENT` payload shape.
+ * Kept for back-compat; `createPaymentClient` is version-aware internally.
+ */
+export async function signPayment(
+  wallet: WalletClient,
+  requirement: PaymentRequirement,
+): Promise<PaymentPayload> {
+  return {
+    x402Version: 1,
+    scheme: 'exact',
+    network: requirement.network,
+    payload: await signExactAuthorization(wallet, requirement),
+  }
+}
+
+/** Resolve a network to an EVM chain id — v1 friendly names and CAIP-2 ids. */
+function chainIdForNetwork(network: string): number | null {
+  if (network.startsWith('eip155:')) {
+    const id = Number(network.slice('eip155:'.length))
+    return Number.isInteger(id) && id > 0 ? id : null
+  }
+  switch (network as X402Network) {
     case 'base':
       return 8453
     case 'base-sepolia':
@@ -175,5 +262,7 @@ function chainIdForNetwork(network: X402Network): number {
       return 42161
     case 'polygon':
       return 137
+    default:
+      return null
   }
 }
