@@ -14,7 +14,13 @@
 export { yeetful, GrantError } from './agent.js'
 export type { AgentOptions, GrantPolicy, GrantViolation, Receipt, PayFn } from './agent.js'
 
-export { createPaymentClient, signPayment, PaymentError } from './client.js'
+export {
+  createPaymentClient,
+  signPayment,
+  signExactAuthorization,
+  requirementAtomicAmount,
+  PaymentError,
+} from './client.js'
 export type { ClientOptions } from './client.js'
 
 export { gate, Facilitator, DEFAULT_FACILITATOR_URL } from './server.js'
@@ -24,6 +30,7 @@ export { usdcAddress, usdToAtomic, encodePayment, decodePayment } from './utils.
 
 export type {
   PaymentPayload,
+  PaymentEnvelopeV2,
   PaymentRequirement,
   PaymentRequiredResponse,
   FacilitatorConfig,
