@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- **New: hosted-ledger sync.** `yeetful({ wallet, grant, apiKey, ledgerUrl? })` —
+  with a yeetful.com API key (`yf_…`, minted on the dashboard) and the hosted
+  grant's `id`, every receipt (settlements **and** denials) POSTs to
+  `{ledgerUrl}/api/grants/{grant.id}/ledger` with Bearer auth, so dashboard
+  budgets and the audit feed include headless agents. Sync is an ordered,
+  best-effort chain that never blocks or fails a payment.
+- **New: `pay.flushLedger()`** — await before a short-lived script exits so the
+  last receipts aren't dropped with the process.
+- `apiKey` without `grant.id` warns once via `onEvent` and disables sync.
+
 ## 0.2.0
 
 - **New: `yeetful/agent` — the agent expense account.** `yeetful({ wallet, grant })`
