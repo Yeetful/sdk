@@ -336,3 +336,36 @@ describe('x402 v2 challenges (CAIP-2 networks, `amount`, PAYMENT-SIGNATURE)', ()
     expect(receipts[0]).toMatchObject({ ok: false, note: 'payment-failed' })
   })
 })
+
+describe('ledger sync redirect diagnosis', () => {
+  it('names the redirect origin when a cross-origin hop strips the auth header', async () => {
+    const f = mockFetch('10000')
+    const events: string[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.startsWith('https://yeetful.test')) {
+        // Simulate fetch having followed apex → www and the Bearer being lost.
+        const res = new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 })
+        Object.defineProperty(res, 'redirected', { value: true })
+        Object.defineProperty(res, 'url', { value: 'https://www.yeetful.test/api/grants/g1/ledger' })
+        return res
+      }
+      return f.fn(input, init)
+    }) as typeof fetch
+
+    const pay = yeetful({
+      wallet,
+      grant: grant({ id: 'g1' }),
+      fetch: fn,
+      apiKey: 'yf_' + 'a'.repeat(64),
+      ledgerUrl: 'https://yeetful.test',
+      onEvent: (m) => { events.push(m) },
+    })
+    await pay(URL_OK)
+    await pay.flushLedger()
+
+    const hint = events.find((m) => m.includes('ledger sync → 401'))
+    expect(hint).toContain('redirected to https://www.yeetful.test')
+    expect(hint).toContain('set ledgerUrl')
+  })
+})
