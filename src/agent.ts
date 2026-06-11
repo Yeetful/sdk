@@ -199,7 +199,14 @@ export function yeetful(options: AgentOptions): PayFn {
             note: r.note,
           }),
         })
-        if (!res.ok) log(`ledger sync → ${res.status} for ${r.host}`)
+        if (!res.ok) {
+          // fetch silently DROPS the Authorization header when it follows a
+          // cross-origin redirect (e.g. apex → www) — surface the real cause.
+          const moved = res.redirected
+            ? ` (request was redirected to ${new URL(res.url).origin}, which strips the auth header — set ledgerUrl to that origin)`
+            : ''
+          log(`ledger sync → ${res.status} for ${r.host}${moved}`)
+        }
       })
       .catch((err) => {
         log(`ledger sync failed for ${r.host}: ${err instanceof Error ? err.message : err}`)
