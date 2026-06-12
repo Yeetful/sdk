@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0
+
+- **New: per-key agent budgets are enforced by the SDK.** On yeetful.com an
+  agent IS an API key, and each key can carry a per-day USD budget (dashboard
+  → Agents tab). With `apiKey` set, `yeetful()` now loads the key's policy
+  from `GET {ledgerUrl}/api/agent/policy` (Bearer auth) before the first
+  payment and **refuses to pay** — throwing `GrantError('OVER_AGENT_BUDGET')`
+  and emitting/syncing a denial receipt — when the key is over budget or a
+  call's 402 price would exceed `remainingTodayUsd`. Budgets are advisory at
+  the rails (the agent pays from its own wallet), so this local refusal is
+  the enforcement model; hard on-chain enforcement arrives with Coinbase
+  Spend Permissions. (This replaces the parked "per-host caps" design
+  question from 0.3: budgets are per key, not per host.)
+- The budget stays fresh opportunistically: receipt-sync responses echo the
+  updated `{ agent }` snapshot, `pay.flushLedger()` re-fetches the policy
+  (picking up dashboard edits mid-run), and settled-but-unsynced local spend
+  is counted against the budget in the meantime.
+- **New: `pay.agentBudget()`** — the last-known `AgentBudget`
+  (`keyId` / `label` / `perDayUsd` / `spentTodayUsd` / `remainingTodayUsd` /
+  `overBudget`), and the `AgentBudget` type is exported.
+- A failed policy fetch is logged via `onEvent` and never blocks payments
+  (the grant alone still gates them); the policy GET gets the same
+  cross-origin-redirect diagnosis as ledger sync — keep `ledgerUrl` on the
+  canonical origin (currently `https://www.yeetful.com`).
+
+## 0.3.2
+
+- Ledger sync: when a receipt POST fails after a cross-origin redirect (e.g.
+  apex → www, which silently strips the `Authorization` header), the
+  `onEvent` log now names the redirect origin and tells you to point
+  `ledgerUrl` at it.
+
 ## 0.3.1
 
 - **Fix: x402 v2 challenges crashed the client** (`TypeError: Cannot convert

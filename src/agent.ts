@@ -30,7 +30,9 @@
  * })
  *
  * const res = await pay('https://tripadvisor.x402.paysponge.com/api/v1/location/search?searchQuery=tokyo')
- * // throws GrantError on NOT_ALLOWED / OVER_PER_CALL / BUDGET_EXCEEDED / EXPIRED
+ * // throws GrantError on NOT_ALLOWED / OVER_PER_CALL / BUDGET_EXCEEDED /
+ * // EXPIRED / OVER_AGENT_BUDGET (the API key's per-day budget, set on the
+ * // dashboard's Agents tab — fetched from /api/agent/policy and enforced here)
  * ```
  */
 
@@ -45,6 +47,7 @@ export type GrantViolation =
   | 'NOT_ALLOWED'
   | 'OVER_PER_CALL'
   | 'BUDGET_EXCEEDED'
+  | 'OVER_AGENT_BUDGET'
 
 export class GrantError extends Error {
   constructor(
@@ -70,6 +73,26 @@ export interface GrantPolicy {
   expiresAt?: number | string | Date
   /** 'active' | 'revoked'. Defaults to active. */
   status?: string
+}
+
+/**
+ * The hosted per-key budget for this agent (an agent IS an API key on
+ * yeetful.com). Fetched from `GET {ledgerUrl}/api/agent/policy` with Bearer
+ * auth and echoed back on every receipt-sync response. Budgets are advisory
+ * at the rails — the agent pays from its own wallet — so this SDK is the
+ * enforcement point: it refuses to pay once the key is over budget.
+ */
+export interface AgentBudget {
+  /** Id of the API key (the agent identity) on yeetful.com. */
+  keyId: string
+  /** Human label the key was minted with. */
+  label?: string | null
+  /** Per-day USD budget for this key; null = no budget set (no enforcement). */
+  perDayUsd: number | null
+  /** USD this key has spent today per the hosted ledger. */
+  spentTodayUsd: number
+  remainingTodayUsd: number | null
+  overBudget: boolean
 }
 
 /** A single authorization decision — the audit trail + x402 receipt. */
@@ -102,9 +125,20 @@ export interface AgentOptions {
    * `{ledgerUrl}/api/grants/{grant.id}/ledger` with Bearer auth, so the
    * dashboard's budgets/audit trail include this agent's calls. Sync is
    * best-effort and never blocks or fails a payment.
+   *
+   * The key also carries a per-day budget set on the dashboard's Agents tab.
+   * With `apiKey`, the SDK loads it from `GET {ledgerUrl}/api/agent/policy`
+   * before the first payment and refuses to pay (`OVER_AGENT_BUDGET`) once
+   * the key is over budget — the budget is advisory at the rails (the agent
+   * pays from its own wallet), so this local refusal IS the enforcement.
+   * If the policy can't be fetched, payments proceed under the grant alone.
    */
   apiKey?: string
-  /** Base URL of the hosted ledger. Defaults to https://yeetful.com. */
+  /**
+   * Base URL of the hosted ledger. Defaults to https://yeetful.com. Must be
+   * the CANONICAL origin (e.g. https://www.yeetful.com) — fetch silently
+   * drops the Authorization header when it follows a cross-origin redirect.
+   */
   ledgerUrl?: string
 }
 
@@ -117,9 +151,16 @@ export interface PayFn {
   /** USD spent over the life of this client instance. */
   spentTotalUsd(): number
   /**
+   * Last-known per-key budget from yeetful.com — null without `apiKey` or
+   * until the policy loads. Kept fresh by receipt-sync responses and
+   * `flushLedger()`.
+   */
+  agentBudget(): AgentBudget | null
+  /**
    * Resolves once every hosted-ledger sync issued so far has settled (no-op
    * without `apiKey`). Await this before a short-lived script exits so the
-   * last receipts aren't dropped with the process.
+   * last receipts aren't dropped with the process. Also re-fetches the
+   * per-key budget so a dashboard edit mid-run is picked up.
    */
   flushLedger(): Promise<void>
 }
@@ -170,17 +211,52 @@ export function yeetful(options: AgentOptions): PayFn {
   let dayIndex = utcDayIndex(Date.now())
 
   // ── Hosted-ledger sync (optional): receipts → POST /api/grants/:id/ledger ──
+  const ledgerBase = (options.ledgerUrl ?? 'https://yeetful.com').replace(/\/+$/, '')
   const ledgerEndpoint =
-    options.apiKey && grant.id
-      ? `${(options.ledgerUrl ?? 'https://yeetful.com').replace(/\/+$/, '')}/api/grants/${grant.id}/ledger`
-      : null
+    options.apiKey && grant.id ? `${ledgerBase}/api/grants/${grant.id}/ledger` : null
   if (options.apiKey && !grant.id) {
     log('hosted-ledger sync disabled: grant.id is not set (use the id of your yeetful.com grant)')
   }
+  const ledgerFetch = options.fetch ?? globalThis.fetch
+  // fetch silently DROPS the Authorization header when it follows a
+  // cross-origin redirect (e.g. apex → www) — surface the real cause.
+  const redirectHint = (res: Response) =>
+    res.redirected
+      ? ` (request was redirected to ${new URL(res.url).origin}, which strips the auth header — set ledgerUrl to that origin)`
+      : ''
+
+  // ── Per-key agent budget (optional): GET /api/agent/policy with the key ──
+  const policyEndpoint = options.apiKey ? `${ledgerBase}/api/agent/policy` : null
+  let agent: AgentBudget | null = null
+  // Settled spend the server snapshot can't know about yet (receipts sync
+  // asynchronously) — counted against the budget so it binds between syncs.
+  let agentUnsyncedUsd = 0
+  const refreshAgentBudget = async (): Promise<void> => {
+    if (!policyEndpoint) return
+    try {
+      const res = await ledgerFetch(policyEndpoint, {
+        headers: { authorization: `Bearer ${options.apiKey}` },
+      })
+      if (!res.ok) {
+        log(`agent policy → ${res.status}${redirectHint(res)}`)
+        return
+      }
+      const body = (await res.json()) as { agent?: AgentBudget } | null
+      if (body?.agent) {
+        agent = body.agent
+        agentUnsyncedUsd = 0
+      }
+    } catch (err) {
+      log(`agent policy fetch failed: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+  // The budget is enforced HERE (advisory at the rails) — load it before the
+  // first payment; a failed load is logged and payments proceed grant-only.
+  const policyReady = refreshAgentBudget()
+
   // A chain (not fire-and-forget) so receipts land in order and flushLedger()
   // can await them; one failed POST is logged and never poisons the chain.
   let ledgerChain: Promise<void> = Promise.resolve()
-  const ledgerFetch = options.fetch ?? globalThis.fetch
   const sync = (r: Receipt) => {
     if (!ledgerEndpoint) return
     ledgerChain = ledgerChain
@@ -200,12 +276,17 @@ export function yeetful(options: AgentOptions): PayFn {
           }),
         })
         if (!res.ok) {
-          // fetch silently DROPS the Authorization header when it follows a
-          // cross-origin redirect (e.g. apex → www) — surface the real cause.
-          const moved = res.redirected
-            ? ` (request was redirected to ${new URL(res.url).origin}, which strips the auth header — set ledgerUrl to that origin)`
-            : ''
-          log(`ledger sync → ${res.status} for ${r.host}${moved}`)
+          log(`ledger sync → ${res.status} for ${r.host}${redirectHint(res)}`)
+          return
+        }
+        // Receipt-sync responses echo the key's budget — opportunistic refresh.
+        // The snapshot includes the receipt just written (and every earlier
+        // synced one, each already subtracted on its own response), so only
+        // this receipt's amount leaves the unsynced bucket.
+        const body = (await res.json().catch(() => null)) as { agent?: AgentBudget } | null
+        if (body?.agent) {
+          agent = body.agent
+          if (r.ok) agentUnsyncedUsd = Math.max(0, agentUnsyncedUsd - r.amountUsd)
         }
       })
       .catch((err) => {
@@ -227,20 +308,42 @@ export function yeetful(options: AgentOptions): PayFn {
     input: string | URL | Request,
     init: RequestInit = {},
   ): Promise<Response> {
-    // Roll the daily budget at UTC midnight.
+    // The per-key budget must be known before the first payment (no-op after).
+    await policyReady
+
+    // Roll the daily budgets at UTC midnight.
     const today = utcDayIndex(Date.now())
     if (today !== dayIndex) {
       dayIndex = today
       spentToday = 0
+      // The server's "today" rolled too — clear the stale daily fields and
+      // re-fetch the truth in the background.
+      if (agent) {
+        agent = {
+          ...agent,
+          spentTodayUsd: 0,
+          remainingTodayUsd: agent.perDayUsd,
+          overBudget: agent.perDayUsd != null && agent.perDayUsd <= 0,
+        }
+      }
+      agentUnsyncedUsd = 0
+      void refreshAgentBudget()
     }
 
     const host = hostOf(input)
 
-    // ── Pre-flight policy (no network): status → expiry → allowlist ─────────
+    // ── Pre-flight policy (no network): status → expiry → allowlist → key ───
     if ((grant.status ?? 'active') === 'revoked') deny(host, 'REVOKED', 'grant is revoked')
     if (Date.now() > expiryMs(grant.expiresAt)) deny(host, 'EXPIRED', 'grant has expired')
     if (!grant.allow.map((h) => h.toLowerCase()).includes(host)) {
       deny(host, 'NOT_ALLOWED', `${host} is not in this grant's allowlist`)
+    }
+    if (agent?.overBudget) {
+      deny(
+        host,
+        'OVER_AGENT_BUDGET',
+        `agent key${agent.label ? ` "${agent.label}"` : ''} is over its $${agent.perDayUsd}/day budget ($${agent.spentTodayUsd.toFixed(2)} spent today)`,
+      )
     }
 
     // Price is only known from the 402 challenge — check caps in the hook,
@@ -265,6 +368,12 @@ export function yeetful(options: AgentOptions): PayFn {
         if (grant.totalUsd != null && spentTotal + price > grant.totalUsd) {
           deny(host, 'BUDGET_EXCEEDED', `$${(spentTotal + price).toFixed(2)} exceeds lifetime cap $${grant.totalUsd}`)
         }
+        if (agent && agent.perDayUsd != null) {
+          const agentSpent = agent.spentTodayUsd + agentUnsyncedUsd
+          if (agentSpent + price > agent.perDayUsd) {
+            deny(host, 'OVER_AGENT_BUDGET', `$${price.toFixed(4)} would take this agent key to $${(agentSpent + price).toFixed(2)}, over its $${agent.perDayUsd}/day budget`)
+          }
+        }
         pricedUsd = price
         return true
       },
@@ -285,6 +394,7 @@ export function yeetful(options: AgentOptions): PayFn {
     if (pricedUsd > 0) {
       spentToday += pricedUsd
       spentTotal += pricedUsd
+      agentUnsyncedUsd += pricedUsd
     }
     const txHash = txHashOf(res)
     emit({ host, amountUsd: pricedUsd, ok: true, txHash, note: 'settled', ts: Date.now() })
@@ -295,6 +405,11 @@ export function yeetful(options: AgentOptions): PayFn {
   pay.spentTodayUsd = () => spentToday
   pay.remainingTodayUsd = () => Math.max(0, grant.perDayUsd - spentToday)
   pay.spentTotalUsd = () => spentTotal
-  pay.flushLedger = () => ledgerChain
+  pay.agentBudget = () => agent
+  pay.flushLedger = async () => {
+    await ledgerChain
+    // Opportunistic re-sync: picks up a budget edited on the dashboard mid-run.
+    await refreshAgentBudget()
+  }
   return pay
 }
