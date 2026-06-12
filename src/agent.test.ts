@@ -122,6 +122,10 @@ describe('hosted-ledger sync', () => {
     const posts: { url: string; auth: string | null; body: Record<string, unknown> }[] = []
     const fn = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.endsWith('/api/agent/policy')) {
+        // No per-key budget configured for these tests.
+        return new Response(JSON.stringify({ error: 'no budget' }), { status: 404 })
+      }
       if (url.startsWith(LEDGER)) {
         posts.push({
           url,
@@ -205,6 +209,7 @@ describe('hosted-ledger sync', () => {
     let failures = 0
     const flaky = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.endsWith('/api/agent/policy')) return new Response('{}', { status: 404 })
       if (url.startsWith(LEDGER)) {
         failures++
         if (failures === 1) throw new Error('network down')
@@ -337,6 +342,186 @@ describe('x402 v2 challenges (CAIP-2 networks, `amount`, PAYMENT-SIGNATURE)', ()
   })
 })
 
+describe('per-key agent budget (/api/agent/policy)', () => {
+  const LEDGER = 'https://yeetful.test'
+  const KEY = 'yf_' + 'b'.repeat(64)
+
+  type ServerAgent = {
+    keyId: string
+    label?: string | null
+    perDayUsd: number | null
+    spentTodayUsd: number
+    remainingTodayUsd: number | null
+    overBudget: boolean
+  }
+
+  function agentState(over: Partial<ServerAgent> = {}): ServerAgent {
+    return {
+      keyId: 'key_1',
+      label: 'travel-bot',
+      perDayUsd: 2,
+      spentTodayUsd: 0,
+      remainingTodayUsd: 2,
+      overBudget: false,
+      ...over,
+    }
+  }
+
+  /**
+   * Mock hosted origin: GET /api/agent/policy and POST …/ledger both read one
+   * mutable `state.agent`; like the real API, a Bearer-authed ledger POST
+   * echoes the updated { agent } in its response (unless echo: false).
+   */
+  function withPolicy(
+    payFetch: typeof fetch,
+    state: { agent: ServerAgent | null; echo?: boolean; policyDown?: boolean },
+  ) {
+    const policyGets: { auth: string | null }[] = []
+    const posts: { body: Record<string, unknown> }[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === `${LEDGER}/api/agent/policy`) {
+        policyGets.push({ auth: new Headers(init?.headers).get('authorization') })
+        if (state.policyDown) return new Response('{}', { status: 503 })
+        if (!state.agent) return new Response('{}', { status: 404 })
+        return new Response(JSON.stringify({ agent: state.agent, grant: {} }), { status: 200 })
+      }
+      if (url.startsWith(LEDGER)) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        posts.push({ body })
+        const a = state.agent
+        if (a && body.ok === true && typeof body.amountUsd === 'number') {
+          a.spentTodayUsd = +(a.spentTodayUsd + body.amountUsd).toFixed(6)
+          if (a.perDayUsd != null) {
+            a.remainingTodayUsd = Math.max(0, a.perDayUsd - a.spentTodayUsd)
+            a.overBudget = a.spentTodayUsd >= a.perDayUsd
+          }
+        }
+        const payload = state.echo === false ? { id: 'led_1' } : { id: 'led_1', agent: state.agent }
+        return new Response(JSON.stringify(payload), { status: 201 })
+      }
+      return payFetch(input, init)
+    }) as typeof fetch
+    return { fn, policyGets, posts }
+  }
+
+  function budgetPay(fetchFn: typeof fetch, over: Partial<GrantPolicy> = {}, onEvent?: (m: string) => void) {
+    return yeetful({
+      wallet,
+      grant: grant({ id: 'grant123', ...over }),
+      fetch: fetchFn,
+      apiKey: KEY,
+      ledgerUrl: LEDGER,
+      onEvent,
+    })
+  }
+
+  it('loads the budget at startup with Bearer auth and pays when under it', async () => {
+    const f = mockFetch('10000') // $0.01
+    const state = { agent: agentState({ spentTodayUsd: 1, remainingTodayUsd: 1 }) }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+    expect(l.policyGets).toHaveLength(1)
+    expect(l.policyGets[0]!.auth).toBe(`Bearer ${KEY}`)
+
+    await pay.flushLedger() // ledger echo + refresh reflect the synced $0.01
+    expect(pay.agentBudget()).toMatchObject({ keyId: 'key_1', spentTodayUsd: 1.01, overBudget: false })
+  })
+
+  it('refuses pre-flight when the key is already over budget (OVER_AGENT_BUDGET, receipted)', async () => {
+    const f = mockFetch('10000')
+    const state = { agent: agentState({ spentTodayUsd: 2.5, remainingTodayUsd: 0, overBudget: true }) }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ name: 'GrantError', code: 'OVER_AGENT_BUDGET' })
+    expect(f.calls).toHaveLength(0) // denied before any call to the paid host
+
+    await pay.flushLedger() // the denial lands in the hosted audit trail
+    expect(l.posts[0]!.body).toMatchObject({ host: HOST, amountUsd: 0, ok: false, note: 'OVER_AGENT_BUDGET' })
+  })
+
+  it('refuses a call that would exceed remainingTodayUsd', async () => {
+    const f = mockFetch('10000') // $0.01 > $0.005 remaining
+    const state = { agent: agentState({ spentTodayUsd: 1.995, remainingTodayUsd: 0.005 }) }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_AGENT_BUDGET' })
+    expect(f.calls).toHaveLength(1) // 402 challenge read, payment never signed
+    expect(pay.spentTodayUsd()).toBe(0)
+  })
+
+  it('counts settled-but-unsynced spend against the budget', async () => {
+    const f = mockFetch('10000') // $0.01 per call
+    const state = { agent: agentState({ perDayUsd: 0.015, remainingTodayUsd: 0.015 }), echo: false }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    await pay(URL_OK) // $0.01 settled; server snapshot still says $0 spent
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_AGENT_BUDGET' })
+  })
+
+  it('receipt-sync responses keep the budget fresh (no policy re-fetch needed)', async () => {
+    const f = mockFetch('10000')
+    const state: { agent: ServerAgent | null; policyDown?: boolean } = {
+      agent: agentState({ perDayUsd: 0.015, remainingTodayUsd: 0.015 }),
+    }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    await pay(URL_OK)
+    state.policyDown = true // flushLedger's re-fetch fails; only the POST echo can update
+    await pay.flushLedger()
+    expect(pay.agentBudget()).toMatchObject({ spentTodayUsd: 0.01 })
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_AGENT_BUDGET' })
+  })
+
+  it('flushLedger re-fetches the budget (dashboard edits mid-run are picked up)', async () => {
+    const f = mockFetch('10000')
+    const state = { agent: agentState() }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    await pay(URL_OK)
+    state.agent = agentState({ perDayUsd: 0.005, spentTodayUsd: 0.01, remainingTodayUsd: 0, overBudget: true })
+    await pay.flushLedger()
+    expect(pay.agentBudget()?.overBudget).toBe(true)
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_AGENT_BUDGET' })
+  })
+
+  it('a key with no budget set enforces nothing', async () => {
+    const f = mockFetch('10000')
+    const state = { agent: agentState({ perDayUsd: null, remainingTodayUsd: null }) }
+    const l = withPolicy(f.fn, state)
+    const pay = budgetPay(l.fn)
+
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+    expect(pay.agentBudget()).toMatchObject({ perDayUsd: null })
+  })
+
+  it('a failing policy endpoint never blocks payments (budgets are advisory)', async () => {
+    const f = mockFetch('10000')
+    const events: string[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.endsWith('/api/agent/policy')) throw new Error('network down')
+      if (url.startsWith(LEDGER)) return new Response('{}', { status: 201 })
+      return f.fn(input, init)
+    }) as typeof fetch
+    const pay = budgetPay(fn, {}, (m) => { events.push(m) })
+
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+    expect(pay.agentBudget()).toBeNull()
+    expect(events.some((m) => m.includes('agent policy fetch failed'))).toBe(true)
+  })
+})
+
 describe('ledger sync redirect diagnosis', () => {
   it('names the redirect origin when a cross-origin hop strips the auth header', async () => {
     const f = mockFetch('10000')
@@ -367,5 +552,9 @@ describe('ledger sync redirect diagnosis', () => {
     const hint = events.find((m) => m.includes('ledger sync → 401'))
     expect(hint).toContain('redirected to https://www.yeetful.test')
     expect(hint).toContain('set ledgerUrl')
+
+    // The startup policy GET hit the same redirect — same diagnosis there.
+    const policyHint = events.find((m) => m.includes('agent policy → 401'))
+    expect(policyHint).toContain('set ledgerUrl')
   })
 })

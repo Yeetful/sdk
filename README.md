@@ -38,7 +38,7 @@ try {
   console.log(await res.json())
   console.log(`spent today: $${pay.spentTodayUsd()} / left: $${pay.remainingTodayUsd()}`)
 } catch (e) {
-  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED
+  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED | OVER_AGENT_BUDGET
   if (e instanceof GrantError) console.error(`blocked: ${e.code}`)
 }
 ```
@@ -60,6 +60,22 @@ await pay.flushLedger() // before a short-lived script exits
 ```
 
 Sync is best-effort and never blocks or fails a payment; denials are synced too (`ok: false` with the violation code).
+
+> **`ledgerUrl` must be the canonical origin** (currently `https://www.yeetful.com`): `fetch` silently drops the `Authorization` header when it follows a cross-origin redirect such as apex → www. If sync or the policy fetch fails after a redirect, the `onEvent` log names the origin to use.
+
+### Per-key agent budgets
+
+On yeetful.com an agent **is** an API key — the dashboard's Agents tab gives each key a per-day USD budget and a spent-today meter. When you pass `apiKey`, the SDK fetches the key's policy (`GET /api/agent/policy`) before the first payment and **refuses to pay** once the key is over budget, or when a call's quoted price would exceed what's left today:
+
+```ts
+const pay = yeetful({ wallet, grant: { id: 'your-grant-id', ... }, apiKey: process.env.YEETFUL_API_KEY })
+
+console.log(pay.agentBudget()) // { keyId, label, perDayUsd, spentTodayUsd, remainingTodayUsd, overBudget }
+// over budget → pay() throws GrantError('OVER_AGENT_BUDGET') and syncs the
+// denial receipt, so the refusal shows up in the dashboard audit trail.
+```
+
+Budgets are **advisory at the rails** — the agent pays from its own wallet, so this local refusal is the enforcement point. The snapshot stays fresh opportunistically: receipt-sync responses echo the updated budget, `flushLedger()` re-fetches the policy (picking up mid-run dashboard edits), and settled-but-unsynced spend is counted locally in between. If the policy can't be fetched at all, payments proceed under the grant alone.
 
 > **Local vs. hard enforcement.** This SDK enforces the grant in-process — ideal for governing *your own* agents (runaway loops, bugs, injected tool calls). For adversarial guarantees, back the grant with an on-chain Coinbase **Spend Permission** so the wallet contract caps spend regardless of the SDK.
 
