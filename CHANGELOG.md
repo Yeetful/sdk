@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+- **New: org budgets — the two-level cap.** When the API key belongs to an
+  organization on yeetful.com, `yeetful()` now reads the org's daily USD cap
+  from the policy (`org` block) — summed across all the org's agents, *above*
+  each key's own budget — and **refuses to pay** with
+  `GrantError('OVER_ORG_BUDGET')` when the org is over its cap or a call's 402
+  price would breach it. Over **either** level (per-key or org) stops the
+  payment.
+- **New: remote kill switch.** The policy + every receipt-sync echo now carry
+  a `halted` / `haltReason` flag. When an admin pauses a single agent
+  (`AGENT_PAUSED`) or freezes the whole expense account (`ACCOUNT_FROZEN`) on
+  the dashboard, the SDK halts **all** payments — a hard stop before any
+  budget arithmetic or network call — and resumes on the next policy refresh
+  once unfrozen.
+- Both ride the same `apiKey` flow as per-key budgets: loaded at startup,
+  refreshed from the sync echo and `pay.flushLedger()`, with settled-but-
+  unsynced org spend counted locally between syncs. Advisory at the rails for
+  SDK agents (this local refusal is the enforcement); the chats Yeetful itself
+  executes are hard-stopped server-side. A failed policy fetch degrades open.
+- **New: `pay.orgBudget()`** (last-known `OrgBudget` | null) and
+  **`pay.status()`** (`{ halted, haltReason }`).
+- New `GrantViolation` codes: `OVER_ORG_BUDGET`, `AGENT_PAUSED`,
+  `ACCOUNT_FROZEN`. New exported types `OrgBudget`, `HaltStatus`, `HaltReason`.
+
 ## 0.4.0
 
 - **New: per-key agent budgets are enforced by the SDK.** On yeetful.com an
