@@ -31,8 +31,10 @@
  *
  * const res = await pay('https://tripadvisor.x402.paysponge.com/api/v1/location/search?searchQuery=tokyo')
  * // throws GrantError on NOT_ALLOWED / OVER_PER_CALL / BUDGET_EXCEEDED /
- * // EXPIRED / OVER_AGENT_BUDGET (the API key's per-day budget, set on the
- * // dashboard's Agents tab — fetched from /api/agent/policy and enforced here)
+ * // EXPIRED / OVER_AGENT_BUDGET (the key's per-day budget) and — for an org
+ * // key (0.5) — OVER_ORG_BUDGET (the org's daily cap, the level above) plus
+ * // the remote kill switch AGENT_PAUSED / ACCOUNT_FROZEN. All fetched from
+ * // /api/agent/policy, refreshed on every receipt sync, and enforced here.
  * ```
  */
 
@@ -48,6 +50,15 @@ export type GrantViolation =
   | 'OVER_PER_CALL'
   | 'BUDGET_EXCEEDED'
   | 'OVER_AGENT_BUDGET'
+  // 0.5 — the org level of the two-level budget + the remote kill switch.
+  | 'OVER_ORG_BUDGET'
+  | 'AGENT_PAUSED'
+  | 'ACCOUNT_FROZEN'
+
+/** The remote kill switch (yeetful.com): a reversible freeze that halts ALL
+ * payments. AGENT_PAUSED = this key; ACCOUNT_FROZEN = the whole expense
+ * account. Surfaced on the policy + every receipt-sync echo. */
+export type HaltReason = 'AGENT_PAUSED' | 'ACCOUNT_FROZEN'
 
 export class GrantError extends Error {
   constructor(
@@ -93,6 +104,32 @@ export interface AgentBudget {
   spentTodayUsd: number
   remainingTodayUsd: number | null
   overBudget: boolean
+}
+
+/**
+ * The org level of the two-level budget (0.5). When an agent's key belongs to
+ * an organization, its policy carries the ORG's daily cap — summed across ALL
+ * the org's keys — above this key's own budget. Over EITHER level = stop.
+ * Present only for org keys; null for personal keys. Same advisory-at-the-rails
+ * model as the per-key budget: the SDK is the enforcement point.
+ */
+export interface OrgBudget {
+  /** Id of the organization on yeetful.com. */
+  id: string
+  /** Org name, when the policy includes it. */
+  name?: string | null
+  /** Org-wide per-day USD cap; null = no org cap (per-key budgets govern). */
+  perDayUsd: number | null
+  /** USD the whole org has spent today per the hosted ledger. */
+  spentTodayUsd: number
+  remainingTodayUsd?: number | null
+  overBudget: boolean
+}
+
+/** The remote halt state (kill switch) from the policy / sync echo. */
+export interface HaltStatus {
+  halted: boolean
+  haltReason: HaltReason | null
 }
 
 /** A single authorization decision — the audit trail + x402 receipt. */
@@ -156,6 +193,18 @@ export interface PayFn {
    * `flushLedger()`.
    */
   agentBudget(): AgentBudget | null
+  /**
+   * Last-known ORG budget from yeetful.com (0.5) — null for personal keys, or
+   * without `apiKey` / until the policy loads. Kept fresh the same way as
+   * `agentBudget()`.
+   */
+  orgBudget(): OrgBudget | null
+  /**
+   * Last-known remote halt state (0.5): the kill switch. `{ halted: false }`
+   * until the policy loads; flips when the key/account is paused on
+   * yeetful.com (refreshed on every sync echo + `flushLedger()`).
+   */
+  status(): HaltStatus
   /**
    * Resolves once every hosted-ledger sync issued so far has settled (no-op
    * without `apiKey`). Await this before a short-lived script exits so the
@@ -225,13 +274,29 @@ export function yeetful(options: AgentOptions): PayFn {
       ? ` (request was redirected to ${new URL(res.url).origin}, which strips the auth header — set ledgerUrl to that origin)`
       : ''
 
-  // ── Per-key agent budget (optional): GET /api/agent/policy with the key ──
+  // ── Hosted policy (optional): GET /api/agent/policy with the key ──
+  // Carries the per-key budget, the ORG budget (0.5), and the kill-switch halt
+  // (0.5). Enforced HERE — all advisory at the rails (the agent pays from its
+  // own wallet), so this SDK's local refusal IS the enforcement.
   const policyEndpoint = options.apiKey ? `${ledgerBase}/api/agent/policy` : null
   let agent: AgentBudget | null = null
+  let org: OrgBudget | null = null
+  let halt: HaltStatus = { halted: false, haltReason: null }
   // Settled spend the server snapshot can't know about yet (receipts sync
-  // asynchronously) — counted against the budget so it binds between syncs.
+  // asynchronously) — counted against each budget so it binds between syncs.
   let agentUnsyncedUsd = 0
-  const refreshAgentBudget = async (): Promise<void> => {
+  let orgUnsyncedUsd = 0
+  /** Apply a policy/echo body's org + halt fields (shared by both refreshers). */
+  const applyOrgAndHalt = (body: { org?: OrgBudget | null; halted?: boolean; haltReason?: HaltReason | null }) => {
+    if ('org' in body) {
+      org = body.org ?? null
+      orgUnsyncedUsd = 0
+    }
+    if ('halted' in body) {
+      halt = { halted: !!body.halted, haltReason: body.haltReason ?? null }
+    }
+  }
+  const refreshPolicy = async (): Promise<void> => {
     if (!policyEndpoint) return
     try {
       const res = await ledgerFetch(policyEndpoint, {
@@ -241,18 +306,22 @@ export function yeetful(options: AgentOptions): PayFn {
         log(`agent policy → ${res.status}${redirectHint(res)}`)
         return
       }
-      const body = (await res.json()) as { agent?: AgentBudget } | null
-      if (body?.agent) {
+      const body = (await res.json()) as
+        | { agent?: AgentBudget; org?: OrgBudget | null; halted?: boolean; haltReason?: HaltReason | null }
+        | null
+      if (!body) return
+      if (body.agent) {
         agent = body.agent
         agentUnsyncedUsd = 0
       }
+      applyOrgAndHalt(body)
     } catch (err) {
       log(`agent policy fetch failed: ${err instanceof Error ? err.message : err}`)
     }
   }
-  // The budget is enforced HERE (advisory at the rails) — load it before the
-  // first payment; a failed load is logged and payments proceed grant-only.
-  const policyReady = refreshAgentBudget()
+  // Load the policy before the first payment; a failed load is logged and
+  // payments proceed under the grant alone (degrade open).
+  const policyReady = refreshPolicy()
 
   // A chain (not fire-and-forget) so receipts land in order and flushLedger()
   // can await them; one failed POST is logged and never poisons the chain.
@@ -279,14 +348,25 @@ export function yeetful(options: AgentOptions): PayFn {
           log(`ledger sync → ${res.status} for ${r.host}${redirectHint(res)}`)
           return
         }
-        // Receipt-sync responses echo the key's budget — opportunistic refresh.
-        // The snapshot includes the receipt just written (and every earlier
-        // synced one, each already subtracted on its own response), so only
-        // this receipt's amount leaves the unsynced bucket.
-        const body = (await res.json().catch(() => null)) as { agent?: AgentBudget } | null
-        if (body?.agent) {
+        // Receipt-sync responses echo the key's budget, the org budget, and
+        // the halt state — opportunistic refresh. The snapshot includes the
+        // receipt just written (and every earlier synced one, each already
+        // subtracted on its own response), so only this receipt's amount
+        // leaves each unsynced bucket.
+        const body = (await res.json().catch(() => null)) as
+          | { agent?: AgentBudget; org?: OrgBudget | null; halted?: boolean; haltReason?: HaltReason | null }
+          | null
+        if (!body) return
+        if (body.agent) {
           agent = body.agent
           if (r.ok) agentUnsyncedUsd = Math.max(0, agentUnsyncedUsd - r.amountUsd)
+        }
+        if ('org' in body) {
+          org = body.org ?? null
+          if (r.ok) orgUnsyncedUsd = Math.max(0, orgUnsyncedUsd - r.amountUsd)
+        }
+        if ('halted' in body) {
+          halt = { halted: !!body.halted, haltReason: body.haltReason ?? null }
         }
       })
       .catch((err) => {
@@ -326,23 +406,50 @@ export function yeetful(options: AgentOptions): PayFn {
           overBudget: agent.perDayUsd != null && agent.perDayUsd <= 0,
         }
       }
+      if (org) {
+        org = {
+          ...org,
+          spentTodayUsd: 0,
+          remainingTodayUsd: org.perDayUsd,
+          overBudget: org.perDayUsd != null && org.perDayUsd <= 0,
+        }
+      }
       agentUnsyncedUsd = 0
-      void refreshAgentBudget()
+      orgUnsyncedUsd = 0
+      void refreshPolicy()
     }
 
     const host = hostOf(input)
 
-    // ── Pre-flight policy (no network): status → expiry → allowlist → key ───
+    // ── Pre-flight policy (no network): status → expiry → allowlist → halt → budgets ─
     if ((grant.status ?? 'active') === 'revoked') deny(host, 'REVOKED', 'grant is revoked')
     if (Date.now() > expiryMs(grant.expiresAt)) deny(host, 'EXPIRED', 'grant has expired')
     if (!grant.allow.map((h) => h.toLowerCase()).includes(host)) {
       deny(host, 'NOT_ALLOWED', `${host} is not in this grant's allowlist`)
+    }
+    // Kill switch (0.5): a remote freeze halts ALL payments, above any budget.
+    if (halt.halted) {
+      const code: GrantViolation = halt.haltReason === 'ACCOUNT_FROZEN' ? 'ACCOUNT_FROZEN' : 'AGENT_PAUSED'
+      deny(
+        host,
+        code,
+        code === 'ACCOUNT_FROZEN'
+          ? 'the expense account is frozen on yeetful.com — resume it to pay'
+          : `this agent key${agent?.label ? ` "${agent.label}"` : ''} is paused on yeetful.com — resume it to pay`,
+      )
     }
     if (agent?.overBudget) {
       deny(
         host,
         'OVER_AGENT_BUDGET',
         `agent key${agent.label ? ` "${agent.label}"` : ''} is over its $${agent.perDayUsd}/day budget ($${agent.spentTodayUsd.toFixed(2)} spent today)`,
+      )
+    }
+    if (org?.overBudget) {
+      deny(
+        host,
+        'OVER_ORG_BUDGET',
+        `org${org.name ? ` "${org.name}"` : ''} is over its $${org.perDayUsd}/day cap ($${org.spentTodayUsd.toFixed(2)} spent today across all its agents)`,
       )
     }
 
@@ -374,6 +481,12 @@ export function yeetful(options: AgentOptions): PayFn {
             deny(host, 'OVER_AGENT_BUDGET', `$${price.toFixed(4)} would take this agent key to $${(agentSpent + price).toFixed(2)}, over its $${agent.perDayUsd}/day budget`)
           }
         }
+        if (org && org.perDayUsd != null) {
+          const orgSpent = org.spentTodayUsd + orgUnsyncedUsd
+          if (orgSpent + price > org.perDayUsd) {
+            deny(host, 'OVER_ORG_BUDGET', `$${price.toFixed(4)} would take the org to $${(orgSpent + price).toFixed(2)}, over its $${org.perDayUsd}/day cap`)
+          }
+        }
         pricedUsd = price
         return true
       },
@@ -395,6 +508,7 @@ export function yeetful(options: AgentOptions): PayFn {
       spentToday += pricedUsd
       spentTotal += pricedUsd
       agentUnsyncedUsd += pricedUsd
+      orgUnsyncedUsd += pricedUsd
     }
     const txHash = txHashOf(res)
     emit({ host, amountUsd: pricedUsd, ok: true, txHash, note: 'settled', ts: Date.now() })
@@ -406,10 +520,13 @@ export function yeetful(options: AgentOptions): PayFn {
   pay.remainingTodayUsd = () => Math.max(0, grant.perDayUsd - spentToday)
   pay.spentTotalUsd = () => spentTotal
   pay.agentBudget = () => agent
+  pay.orgBudget = () => org
+  pay.status = () => halt
   pay.flushLedger = async () => {
     await ledgerChain
-    // Opportunistic re-sync: picks up a budget edited on the dashboard mid-run.
-    await refreshAgentBudget()
+    // Opportunistic re-sync: picks up a budget edited or a pause toggled on
+    // the dashboard mid-run (org cap, per-key budget, and the halt state).
+    await refreshPolicy()
   }
   return pay
 }

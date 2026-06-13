@@ -558,3 +558,141 @@ describe('ledger sync redirect diagnosis', () => {
     expect(policyHint).toContain('set ledgerUrl')
   })
 })
+
+describe('org budget + remote kill switch (0.5)', () => {
+  const LEDGER = 'https://yeetful.test'
+  const KEY = 'yf_' + 'c'.repeat(64)
+
+  type OrgState = { id: string; name?: string | null; perDayUsd: number | null; spentTodayUsd: number; overBudget: boolean }
+
+  /**
+   * Mock hosted origin for an ORG key: the policy GET and the ledger POST echo
+   * both carry { agent, org, halted, haltReason } off one mutable `state`,
+   * mirroring the real /api/agent/policy + sync echo. The per-key budget is
+   * null here so only the org level (and the halt) can refuse.
+   */
+  function withOrgPolicy(
+    payFetch: typeof fetch,
+    state: { org: OrgState | null; halted?: boolean; haltReason?: string | null; policyDown?: boolean; echo?: boolean },
+  ) {
+    const posts: { body: Record<string, unknown> }[] = []
+    const agent = { keyId: 'orgkey_1', label: 'org-runner', perDayUsd: null, spentTodayUsd: 0, remainingTodayUsd: null, overBudget: false }
+    const snapshot = () => ({
+      agent,
+      org: state.org,
+      halted: !!state.halted,
+      haltReason: state.haltReason ?? null,
+      grant: {},
+    })
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url === `${LEDGER}/api/agent/policy`) {
+        if (state.policyDown) return new Response('{}', { status: 503 })
+        return new Response(JSON.stringify(snapshot()), { status: 200 })
+      }
+      if (url.startsWith(LEDGER)) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        posts.push({ body })
+        if (state.org && body.ok === true && typeof body.amountUsd === 'number') {
+          state.org.spentTodayUsd = +(state.org.spentTodayUsd + body.amountUsd).toFixed(6)
+          if (state.org.perDayUsd != null) state.org.overBudget = state.org.spentTodayUsd >= state.org.perDayUsd
+        }
+        const payload = state.echo === false ? { id: 'led_1' } : { id: 'led_1', ...snapshot() }
+        return new Response(JSON.stringify(payload), { status: 201 })
+      }
+      return payFetch(input, init)
+    }) as typeof fetch
+    return { fn, posts }
+  }
+
+  function orgPay(fetchFn: typeof fetch) {
+    return yeetful({ wallet, grant: grant({ id: 'grant123' }), fetch: fetchFn, apiKey: KEY, ledgerUrl: LEDGER })
+  }
+
+  it('exposes the org budget and pays when under the org cap', async () => {
+    const f = mockFetch('10000') // $0.01
+    const l = withOrgPolicy(f.fn, { org: { id: 'org_1', name: 'Acme', perDayUsd: 25, spentTodayUsd: 7, overBudget: false } })
+    const pay = orgPay(l.fn)
+
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+    expect(pay.orgBudget()).toMatchObject({ id: 'org_1', perDayUsd: 25, overBudget: false })
+    expect(pay.status()).toEqual({ halted: false, haltReason: null })
+  })
+
+  it('refuses pre-flight when the org is already over its cap (OVER_ORG_BUDGET, receipted)', async () => {
+    const f = mockFetch('10000')
+    const l = withOrgPolicy(f.fn, { org: { id: 'org_1', perDayUsd: 25, spentTodayUsd: 25, overBudget: true } })
+    const pay = orgPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ name: 'GrantError', code: 'OVER_ORG_BUDGET' })
+    expect(f.calls).toHaveLength(0) // denied before the paid host
+    await pay.flushLedger()
+    expect(l.posts[0]!.body).toMatchObject({ host: HOST, amountUsd: 0, ok: false, note: 'OVER_ORG_BUDGET' })
+  })
+
+  it('refuses a call that would push the org over its remaining cap (in the price hook)', async () => {
+    const f = mockFetch('10000') // $0.01 > $0.005 left
+    const l = withOrgPolicy(f.fn, { org: { id: 'org_1', perDayUsd: 25, spentTodayUsd: 24.995, overBudget: false } })
+    const pay = orgPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_ORG_BUDGET' })
+    expect(f.calls).toHaveLength(1) // 402 read, payment never signed
+  })
+
+  it('counts settled-but-unsynced org spend against the org cap', async () => {
+    const f = mockFetch('10000') // $0.01 per call
+    const l = withOrgPolicy(f.fn, { org: { id: 'org_1', perDayUsd: 0.015, spentTodayUsd: 0, overBudget: false }, echo: false })
+    const pay = orgPay(l.fn)
+
+    await pay(URL_OK) // $0.01 settled; server snapshot still says $0
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'OVER_ORG_BUDGET' })
+  })
+
+  it('a paused agent key halts ALL payments (AGENT_PAUSED, no network, receipted)', async () => {
+    const f = mockFetch('10000')
+    const l = withOrgPolicy(f.fn, { org: null, halted: true, haltReason: 'AGENT_PAUSED' })
+    const pay = orgPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ name: 'GrantError', code: 'AGENT_PAUSED' })
+    expect(f.calls).toHaveLength(0)
+    expect(pay.status()).toEqual({ halted: true, haltReason: 'AGENT_PAUSED' })
+    await pay.flushLedger()
+    expect(l.posts[0]!.body).toMatchObject({ ok: false, note: 'AGENT_PAUSED' })
+  })
+
+  it('a frozen account halts ALL payments (ACCOUNT_FROZEN)', async () => {
+    const f = mockFetch('10000')
+    const l = withOrgPolicy(f.fn, { org: { id: 'org_1', perDayUsd: 25, spentTodayUsd: 0, overBudget: false }, halted: true, haltReason: 'ACCOUNT_FROZEN' })
+    const pay = orgPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'ACCOUNT_FROZEN' })
+    expect(f.calls).toHaveLength(0)
+  })
+
+  it('resume clears the halt on the next policy refresh (reversible)', async () => {
+    const f = mockFetch('10000')
+    const state = { org: null as OrgState | null, halted: true, haltReason: 'AGENT_PAUSED' as string | null }
+    const l = withOrgPolicy(f.fn, state)
+    const pay = orgPay(l.fn)
+
+    await expect(pay(URL_OK)).rejects.toMatchObject({ code: 'AGENT_PAUSED' })
+    state.halted = false // resumed on the dashboard
+    state.haltReason = null
+    await pay.flushLedger() // re-fetches the policy
+    expect(pay.status()).toEqual({ halted: false, haltReason: null })
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+  })
+
+  it('a failing policy endpoint degrades open (no org, not halted)', async () => {
+    const f = mockFetch('10000')
+    const l = withOrgPolicy(f.fn, { org: null, policyDown: true })
+    const pay = orgPay(l.fn)
+
+    const res = await pay(URL_OK)
+    expect(res.status).toBe(200)
+    expect(pay.orgBudget()).toBeNull()
+    expect(pay.status()).toEqual({ halted: false, haltReason: null })
+  })
+})

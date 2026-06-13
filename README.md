@@ -38,7 +38,8 @@ try {
   console.log(await res.json())
   console.log(`spent today: $${pay.spentTodayUsd()} / left: $${pay.remainingTodayUsd()}`)
 } catch (e) {
-  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED | OVER_AGENT_BUDGET
+  // GrantError.code: NOT_ALLOWED | OVER_PER_CALL | BUDGET_EXCEEDED | EXPIRED | REVOKED
+  //   | OVER_AGENT_BUDGET | OVER_ORG_BUDGET | AGENT_PAUSED | ACCOUNT_FROZEN
   if (e instanceof GrantError) console.error(`blocked: ${e.code}`)
 }
 ```
@@ -78,6 +79,25 @@ console.log(pay.agentBudget()) // { keyId, label, perDayUsd, spentTodayUsd, rema
 Budgets are **advisory at the rails** — the agent pays from its own wallet, so this local refusal is the enforcement point. The snapshot stays fresh opportunistically: receipt-sync responses echo the updated budget, `flushLedger()` re-fetches the policy (picking up mid-run dashboard edits), and settled-but-unsynced spend is counted locally in between. If the policy can't be fetched at all, payments proceed under the grant alone.
 
 > **Local vs. hard enforcement.** This SDK enforces the grant in-process — ideal for governing *your own* agents (runaway loops, bugs, injected tool calls). For adversarial guarantees, back the grant with an on-chain Coinbase **Spend Permission** so the wallet contract caps spend regardless of the SDK.
+
+### Org budgets & remote pause (0.5)
+
+If the key belongs to an **organization** on yeetful.com, the same `apiKey` flow adds two more controls — fetched from the policy, refreshed on every sync echo, and enforced locally just like the per-key budget:
+
+- **Two-level budget.** The org has a daily USD cap *above* each key's own budget — summed across all the org's agents. A call that would breach it throws `GrantError('OVER_ORG_BUDGET')`. Over **either** level stops the payment.
+- **Remote kill switch.** An admin can freeze a single agent (`AGENT_PAUSED`) or the whole expense account (`ACCOUNT_FROZEN`) from the dashboard. The SDK halts **all** payments while frozen — a hard stop above any budget arithmetic — and resumes automatically on the next policy refresh once unfrozen.
+
+```ts
+const pay = yeetful({ wallet, grant: { id: 'your-org-grant-id', ... }, apiKey: process.env.YEETFUL_API_KEY })
+
+pay.orgBudget() // { id, name, perDayUsd, spentTodayUsd, overBudget } | null (null for personal keys)
+pay.status()    // { halted, haltReason: 'AGENT_PAUSED' | 'ACCOUNT_FROZEN' | null }
+
+// org over its cap   → GrantError('OVER_ORG_BUDGET')
+// agent/account paused → GrantError('AGENT_PAUSED' | 'ACCOUNT_FROZEN'), before any network call
+```
+
+Same honesty as budgets: pause is advisory at the rails for SDK agents paying their own wallet (this local refusal is the enforcement); the chats Yeetful itself executes are hard-stopped server-side, and on-chain hard stops arrive with Spend Permissions.
 
 ---
 
