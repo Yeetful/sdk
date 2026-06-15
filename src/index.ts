@@ -12,7 +12,17 @@
  */
 
 export { yeetful, GrantError } from './agent.js'
-export type { AgentBudget, AgentOptions, GrantPolicy, GrantViolation, Receipt, PayFn } from './agent.js'
+export type {
+  AgentBudget,
+  AgentOptions,
+  GrantPolicy,
+  GrantViolation,
+  HaltReason,
+  HaltStatus,
+  OrgBudget,
+  Receipt,
+  PayFn,
+} from './agent.js'
 
 export {
   createPaymentClient,
