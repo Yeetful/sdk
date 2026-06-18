@@ -148,3 +148,67 @@ function paymentRequiredResponse(
 }
 
 export { Facilitator, DEFAULT_FACILITATOR_URL } from './facilitator.js'
+
+/** Canonical Yeetful earn-side ingestion endpoint (canonical origin — auth
+ *  headers must survive, so no apex→www redirect). */
+export const DEFAULT_RECEIPTS_URL = 'https://www.yeetful.com/api/mcp/receipts'
+
+export interface ReportUsageOptions {
+  /** Your Yeetful API key (`yf_…`) — attributes the receipt to your account. */
+  apiKey: string
+  /** Your server's slug on yeetful.com (the one you claimed). */
+  mcp: string
+  /** Price of the call in USD. */
+  amountUsd: number | string
+  /** The paying agent's wallet, if known. */
+  payer?: string
+  /** The tool / route that was called (display). */
+  tool?: string
+  /** Settlement network, e.g. `'base'`. */
+  network?: string
+  /** On-chain settlement tx hash, if known. */
+  txHash?: string
+  /** Override the ingestion endpoint (defaults to {@link DEFAULT_RECEIPTS_URL}). */
+  url?: string
+  /** Abort the report after this many ms (default 5000). */
+  timeoutMs?: number
+}
+
+/**
+ * Report one paid call your MCP served to your Yeetful dashboard — the earn-side
+ * mirror of the agent's ledger sync.
+ *
+ * Fire-and-forget by design: it **never throws** and resolves to `false` on any
+ * failure, so it can't break or slow the request it follows. Call it AFTER
+ * settlement and DON'T `await` it on the hot path. On serverless (Vercel/Workers)
+ * hand the returned promise to `ctx.waitUntil(...)` so it isn't dropped when the
+ * function suspends. Resolves `true` on a 2xx.
+ */
+export async function reportUsage(opts: ReportUsageOptions): Promise<boolean> {
+  const url = opts.url ?? DEFAULT_RECEIPTS_URL
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 5000)
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${opts.apiKey}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        mcp: opts.mcp,
+        amountUsd: typeof opts.amountUsd === 'string' ? Number(opts.amountUsd) : opts.amountUsd,
+        payer: opts.payer,
+        tool: opts.tool,
+        network: opts.network,
+        txHash: opts.txHash,
+      }),
+      signal: controller.signal,
+    })
+    return res.ok
+  } catch {
+    return false // earnings telemetry — never surface an error to the caller
+  } finally {
+    clearTimeout(timer)
+  }
+}
