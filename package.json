@@ -1,6 +1,6 @@
 {
   "name": "yeetful",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Spend-controlled x402 for AI agents. Give an agent an expense account — an allowlist + per-call/per-day budget — and pay any x402 endpoint in a few lines. Plus drop-in x402 client/server helpers.",
   "keywords": [
     "x402",

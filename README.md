@@ -224,6 +224,29 @@ export default {
 }
 ```
 
+### Server: track earnings on your dashboard
+
+Claimed your MCP on [yeetful.com](https://www.yeetful.com)? Report each paid call so your earnings — total, last 30 days, calls served, paying agents — show up on your dashboard. `reportUsage()` is **fire-and-forget**: it never throws and never blocks, so call it after `settle()` and don't await it on the hot path (on serverless, hand it to `ctx.waitUntil(...)`).
+
+```ts
+import { gate, reportUsage } from 'yeetful/server'
+
+const { payer, settle } = /* …from gate() … */
+const { header, result } = await settle()
+
+// non-blocking — do NOT await on the request's critical path
+reportUsage({
+  apiKey: process.env.YEETFUL_API_KEY!, // a yf_… key from dashboard/keys
+  mcp: 'your-server-slug',              // your slug on yeetful.com/servers/<slug>
+  amountUsd: 0.01,
+  payer,
+  tool: 'list_proposals',
+  network: 'base',
+})
+```
+
+Full walk-through: [yeetful.com/docs/earn](https://www.yeetful.com/docs/earn).
+
 ### Client: auto-pay
 
 ```ts
@@ -349,8 +372,10 @@ x402 is a natural fit for agent tooling — drop `withPayment` in front of any M
 ### `yeetful/server`
 
 - `gate(request, options)` — runtime-agnostic. Returns `{ type: 'paymentRequired', response }` or `{ type: 'ok', payer, settle }`.
+- `reportUsage(options)` — fire-and-forget earn-side receipt to your Yeetful dashboard. Never throws; resolves `true` on a 2xx.
 - `Facilitator` — thin wrapper around verify/settle HTTP endpoints.
 - `DEFAULT_FACILITATOR_URL` — the hosted facilitator URL.
+- `DEFAULT_RECEIPTS_URL` — the hosted earn-side ingestion URL.
 
 ### `yeetful/next`
 
