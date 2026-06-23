@@ -36,7 +36,7 @@ export type { ClientOptions } from './client.js'
 export { gate, Facilitator, DEFAULT_FACILITATOR_URL } from './server.js'
 export type { RouteGateOptions } from './server.js'
 
-export { usdcAddress, usdToAtomic, encodePayment, decodePayment } from './utils.js'
+export { usdcAddress, usdToAtomic, encodePayment, decodePayment, USDC_DECIMALS } from './utils.js'
 
 export type {
   PaymentPayload,
