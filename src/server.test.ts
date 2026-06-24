@@ -21,7 +21,7 @@ describe('reportUsage', () => {
 
     expect(ok).toBe(true)
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
     expect(url).toBe(DEFAULT_RECEIPTS_URL)
     expect(init.method).toBe('POST')
     expect((init.headers as Record<string, string>).authorization).toBe('Bearer yf_test')
@@ -33,7 +33,7 @@ describe('reportUsage', () => {
     const fetchMock = vi.fn(async () => new Response(null, { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
     await reportUsage({ apiKey: 'yf_x', mcp: 'm', amountUsd: 1, url: 'https://example.test/r' })
-    expect((fetchMock.mock.calls[0] as [string, RequestInit])[0]).toBe('https://example.test/r')
+    expect((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[0]).toBe('https://example.test/r')
   })
 
   it('returns false on a non-2xx without throwing', async () => {
