@@ -8,6 +8,7 @@ export default defineConfig({
     server: 'src/server.ts',
     next: 'src/next.ts',
     express: 'src/express.ts',
+    embed: 'src/embed.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

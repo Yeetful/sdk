@@ -9,6 +9,7 @@
  *   - `yeetful/server`  → runtime-agnostic `gate()`
  *   - `yeetful/next`    → Next.js App Router `withPayment()`
  *   - `yeetful/express` → Express `paymentRequired()` middleware
+ *   - `yeetful/embed`   → browser-only `mountYeetfulChat()` chat-iframe helper
  */
 
 export { yeetful, GrantError } from './agent.js'

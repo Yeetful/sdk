@@ -367,6 +367,70 @@ x402 is a natural fit for agent tooling — drop `withPayment` in front of any M
 
 ---
 
+## Embed the chat
+
+`yeetful/embed` drops the Yeetful chat into any webpage as an iframe — zero
+dependencies, framework-agnostic, browser-only (it never imports viem or the
+payment stack). Scope it to up to 4 MCPs with `mcps`, or float it as a
+bottom-right bubble with `mode: 'bubble'`.
+
+Plain script tag:
+
+```html
+<div id="yeetful-chat" style="height: 560px"></div>
+<script type="module">
+  import { mountYeetfulChat } from 'https://esm.sh/yeetful/embed'
+
+  const chat = mountYeetfulChat({
+    container: '#yeetful-chat',        // element or selector (inline mode)
+    mcps: ['uniswap-free'],            // scope the chat to these MCPs (≤4)
+    theme: 'dark',
+    onEvent: (name, data) => console.log('yeetful event', name, data),
+  })
+  // later: chat.setAddress('0x…') · chat.destroy()
+</script>
+```
+
+React (e.g. a CoW Swap fork), mounting in a `useEffect` and syncing the
+connected account:
+
+```tsx
+import { useEffect, useRef } from 'react'
+import { mountYeetfulChat, type YeetfulChatHandle } from 'yeetful/embed'
+
+function YeetfulChat({ address }: { address?: string }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const chat = useRef<YeetfulChatHandle | null>(null)
+
+  useEffect(() => {
+    chat.current = mountYeetfulChat({
+      container: ref.current!,
+      mcps: ['cow-swap'],
+      address,               // initial context goes in the URL
+      theme: 'dark',
+    })
+    return () => chat.current?.destroy()
+  }, []) // mount once
+
+  useEffect(() => {
+    chat.current?.setAddress(address ?? null) // queued until the embed is ready
+  }, [address])
+
+  return <div ref={ref} style={{ height: 560 }} />
+}
+```
+
+`mountYeetfulChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
+sendPrompt, open, close, destroy }`. `open`/`close` drive the bubble panel
+(no-ops inline); `sendPrompt(text)` injects a prompt as the user's message —
+wire it to host CTAs like an "ask about this order" button (pass
+`{ submit: false }` to only prefill the input); `destroy` removes all DOM
+nodes and listeners. Security: the parent only accepts `postMessage` events
+from the embed origin with `source: 'yeetful-embed'`, and always posts back
+with an explicit `targetOrigin` (never `'*'`).
+
+---
+
 ## API reference
 
 ### `yeetful/server`
@@ -390,6 +454,10 @@ x402 is a natural fit for agent tooling — drop `withPayment` in front of any M
 - `createPaymentClient(options)` — returns a `fetch`-compatible function that handles 402s automatically.
 - `signPayment(wallet, requirement)` — sign a payment payload by hand.
 - `PaymentError` — thrown when the client declines to pay.
+
+### `yeetful/embed`
+
+- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps.
 
 ### Helpers
 
