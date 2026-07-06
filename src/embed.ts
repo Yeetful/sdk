@@ -12,7 +12,27 @@
  *   - parent only accepts messages where event.origin === embed origin AND
  *     payload.source === 'yeetful-embed'; parent→child posts always target
  *     the embed origin (never '*').
+ *
+ * Wallet bridge contract v1.1 (additive):
+ *   - child→parent: rpc {id, method, params?} — an EIP-1193 request to run
+ *     against the host page's wallet provider.
+ *   - parent→child: rpc:result {id, result} | rpc:error {id, error: {code,
+ *     message}} | wallet {accounts, chainId} — the bridge announcement, sent
+ *     after each 'ready' and re-sent on accountsChanged / chainChanged /
+ *     disconnect. Empty accounts = bridge available but not connected.
+ *   - Relayed methods are strictly allowlisted (see RPC_ALLOWLIST).
  */
+
+/**
+ * Minimal EIP-1193 provider surface — kept local so `yeetful/embed` stays
+ * dependency-free. `window.ethereum` and every wagmi/viem/ethers-wrapped
+ * injected provider satisfies this.
+ */
+export interface Eip1193Provider {
+  request(args: { method: string; params?: unknown[] }): Promise<unknown>
+  on?(event: string, listener: (...args: unknown[]) => void): void
+  removeListener?(event: string, listener: (...args: unknown[]) => void): void
+}
 
 export interface YeetfulChatOptions {
   /** Element (or selector) the chat fills. Required for mode 'inline'. */
@@ -33,6 +53,23 @@ export interface YeetfulChatOptions {
   onEvent?: (name: string, data?: unknown) => void
   /** Fired once when the embed signals it is ready. */
   onReady?: () => void
+  /**
+   * Host-wallet bridge: relay the host page's EIP-1193 provider into the
+   * embed so the chat can request accounts, read balances, and pop the
+   * user's own wallet for signatures.
+   *
+   * - `'auto'` (default) — use `window.ethereum` when present, else no
+   *   bridge (silent).
+   * - an {@link Eip1193Provider} — use that provider (e.g. from wagmi).
+   * - `false` — bridge off.
+   *
+   * Security model: the host page already holds this provider — the bridge
+   * grants the embed the same dapp-level access the host page has, nothing
+   * more. Every signature / transaction still pops the USER's own wallet UI
+   * for explicit approval; relayed reads are restricted to a strict method
+   * allowlist; no private key material ever crosses the frame boundary.
+   */
+  wallet?: 'auto' | Eip1193Provider | false
 }
 
 export interface YeetfulChatHandle {
@@ -62,6 +99,39 @@ type ChildMessage =
   | { source: typeof SOURCE; v: number; type: 'ready' }
   | { source: typeof SOURCE; v: number; type: 'resize'; height: number }
   | { source: typeof SOURCE; v: number; type: 'event'; name: string; data?: object }
+  | { source: typeof SOURCE; v: number; type: 'rpc'; id: string; method: string; params?: unknown[] }
+
+/**
+ * EIP-1193 methods the bridge will relay to the host provider. Everything
+ * else is refused with error code 4200 without touching the provider.
+ */
+const RPC_ALLOWLIST = new Set([
+  'eth_requestAccounts',
+  'eth_accounts',
+  'eth_chainId',
+  'net_version',
+  'personal_sign',
+  'eth_signTypedData_v4',
+  'eth_sendTransaction',
+  'wallet_switchEthereumChain',
+  'wallet_addEthereumChain',
+  'eth_getBalance',
+  'eth_call',
+  'eth_estimateGas',
+  'eth_gasPrice',
+  'eth_maxPriorityFeePerGas',
+  'eth_feeHistory',
+  'eth_blockNumber',
+  'eth_getBlockByNumber',
+  'eth_getTransactionByHash',
+  'eth_getTransactionReceipt',
+  'eth_getTransactionCount',
+  'eth_getCode',
+  'eth_getLogs',
+])
+
+/** Max concurrently in-flight relayed requests; excess → rpc:error -32005. */
+const MAX_INFLIGHT_RPC = 16
 
 const CHAT_GLYPH =
   '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -176,6 +246,108 @@ export function mountYeetfulChat(opts: YeetfulChatOptions = {}): YeetfulChatHand
     iframe.contentWindow?.postMessage(payload, embedOrigin)
   }
 
+  /** Post immediately (rpc replies / wallet announcements never queue). */
+  function postNow(msg: Record<string, unknown>) {
+    iframe.contentWindow?.postMessage({ source: SOURCE, v: VERSION, ...msg }, embedOrigin)
+  }
+
+  // --- host-wallet bridge ----------------------------------------------------
+  const walletOpt = opts.wallet ?? 'auto'
+  const provider: Eip1193Provider | undefined =
+    walletOpt === false
+      ? undefined
+      : walletOpt === 'auto'
+        ? ((window as unknown as { ethereum?: Eip1193Provider }).ethereum ?? undefined)
+        : walletOpt
+
+  let lastAccounts: string[] = []
+  let lastChainId: string | null = null
+  let inflightRpc = 0
+
+  function sendWalletAnnouncement() {
+    if (destroyed) return
+    postNow({ type: 'wallet', accounts: lastAccounts, chainId: lastChainId })
+  }
+
+  /** Full announcement: refetch accounts + chainId (each best-effort). */
+  async function announceWallet() {
+    if (!provider) return
+    let accounts: string[] = []
+    let chainId: string | null = null
+    try {
+      const res = await provider.request({ method: 'eth_accounts' })
+      accounts = Array.isArray(res) ? (res as string[]) : []
+    } catch {
+      accounts = []
+    }
+    try {
+      const res = await provider.request({ method: 'eth_chainId' })
+      chainId = typeof res === 'string' ? res : null
+    } catch {
+      chainId = null
+    }
+    lastAccounts = accounts
+    lastChainId = chainId
+    sendWalletAnnouncement()
+  }
+
+  function onAccountsChanged(...args: unknown[]) {
+    lastAccounts = Array.isArray(args[0]) ? (args[0] as string[]) : []
+    sendWalletAnnouncement()
+  }
+  function onChainChanged(...args: unknown[]) {
+    lastChainId = typeof args[0] === 'string' ? args[0] : null
+    sendWalletAnnouncement()
+  }
+  function onDisconnect() {
+    lastAccounts = []
+    sendWalletAnnouncement()
+  }
+
+  if (provider?.on) {
+    provider.on('accountsChanged', onAccountsChanged)
+    provider.on('chainChanged', onChainChanged)
+    provider.on('disconnect', onDisconnect)
+  }
+
+  function handleRpc(msg: { id: string; method: string; params?: unknown[] }) {
+    const { id, method, params } = msg
+    if (typeof id !== 'string' || typeof method !== 'string') return
+    if (!provider) {
+      postNow({ type: 'rpc:error', id, error: { code: 4900, message: 'no host wallet bridge' } })
+      return
+    }
+    if (!RPC_ALLOWLIST.has(method)) {
+      postNow({ type: 'rpc:error', id, error: { code: 4200, message: `${method} is not allowed by yeetful/embed` } })
+      return
+    }
+    if (inflightRpc >= MAX_INFLIGHT_RPC) {
+      postNow({ type: 'rpc:error', id, error: { code: -32005, message: 'too many pending requests' } })
+      return
+    }
+    inflightRpc++
+    // No timeout on purpose: wallet prompts can sit open for minutes.
+    provider.request({ method, params }).then(
+      (result) => {
+        inflightRpc--
+        if (!destroyed) postNow({ type: 'rpc:result', id, result })
+      },
+      (err: unknown) => {
+        inflightRpc--
+        if (destroyed) return
+        const e = err as { code?: unknown; message?: unknown }
+        postNow({
+          type: 'rpc:error',
+          id,
+          error: {
+            code: typeof e?.code === 'number' ? e.code : -32603,
+            message: typeof e?.message === 'string' ? e.message : String(err),
+          },
+        })
+      }
+    )
+  }
+
   function onMessage(event: MessageEvent) {
     if (event.origin !== embedOrigin) return
     const data = event.data as ChildMessage | undefined
@@ -184,6 +356,10 @@ export function mountYeetfulChat(opts: YeetfulChatOptions = {}): YeetfulChatHand
       ready = true
       for (const msg of queue.splice(0)) iframe.contentWindow?.postMessage(msg, embedOrigin)
       opts.onReady?.()
+      // Announce the wallet bridge on every ready — the iframe can reload.
+      if (provider) void announceWallet()
+    } else if (data.type === 'rpc') {
+      handleRpc(data)
     } else if (data.type === 'resize') {
       // Inline only, and only when the host hasn't sized the container itself.
       if (mode === 'inline' && container && container.style.height === '' && typeof data.height === 'number') {
@@ -233,6 +409,11 @@ export function mountYeetfulChat(opts: YeetfulChatOptions = {}): YeetfulChatHand
     if (destroyed) return
     destroyed = true
     window.removeEventListener('message', onMessage)
+    if (provider?.removeListener) {
+      provider.removeListener('accountsChanged', onAccountsChanged)
+      provider.removeListener('chainChanged', onChainChanged)
+      provider.removeListener('disconnect', onDisconnect)
+    }
     if (mode === 'bubble') {
       window.removeEventListener('keydown', onKeydown)
       launcher?.removeEventListener('mouseenter', onHoverIn)
