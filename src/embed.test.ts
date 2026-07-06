@@ -115,6 +115,26 @@ describe('mountYeetfulChat', () => {
     )
   })
 
+  it('sendPrompt posts a prompt message (submit by default, prefill on submit:false)', () => {
+    const h = mount({ container: makeContainer() })
+    const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+    h.sendPrompt('quote 100 USDC to WETH on CoW')
+    expect(postMessage).not.toHaveBeenCalled() // queued until ready
+
+    dispatch(ORIGIN, readyMsg)
+    expect(postMessage).toHaveBeenCalledWith(
+      { source: 'yeetful-embed', v: 1, type: 'prompt', text: 'quote 100 USDC to WETH on CoW', send: true },
+      ORIGIN
+    )
+
+    h.sendPrompt('how do solvers work?', { submit: false })
+    expect(postMessage).toHaveBeenLastCalledWith(
+      { source: 'yeetful-embed', v: 1, type: 'prompt', text: 'how do solvers work?', send: false },
+      ORIGIN
+    )
+  })
+
   it('applies resize height inline only when the container has no explicit height', () => {
     const container = makeContainer()
     const h = mount({ container })

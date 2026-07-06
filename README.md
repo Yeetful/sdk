@@ -421,11 +421,13 @@ function YeetfulChat({ address }: { address?: string }) {
 ```
 
 `mountYeetfulChat(options)` returns a handle: `{ iframe, setAddress, setTheme,
-open, close, destroy }`. `open`/`close` drive the bubble panel (no-ops inline);
-`destroy` removes all DOM nodes and listeners. Security: the parent only
-accepts `postMessage` events from the embed origin with
-`source: 'yeetful-embed'`, and always posts back with an explicit
-`targetOrigin` (never `'*'`).
+sendPrompt, open, close, destroy }`. `open`/`close` drive the bubble panel
+(no-ops inline); `sendPrompt(text)` injects a prompt as the user's message —
+wire it to host CTAs like an "ask about this order" button (pass
+`{ submit: false }` to only prefill the input); `destroy` removes all DOM
+nodes and listeners. Security: the parent only accepts `postMessage` events
+from the embed origin with `source: 'yeetful-embed'`, and always posts back
+with an explicit `targetOrigin` (never `'*'`).
 
 ---
 
@@ -455,7 +457,7 @@ accepts `postMessage` events from the embed origin with
 
 ### `yeetful/embed`
 
-- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `open` / `close` / `destroy`). Browser-only, zero deps.
+- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps.
 
 ### Helpers
 

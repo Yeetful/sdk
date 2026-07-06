@@ -8,7 +8,7 @@
  *   - iframe URL: {origin}/embed?mcps=…&address=…&theme=…&host=…
  *   - all postMessage payloads: { source: 'yeetful-embed', v: 1, type, ... }
  *   - child→parent: ready | resize {height} | event {name, data?}
- *   - parent→child: address {address} | theme {theme}
+ *   - parent→child: address {address} | theme {theme} | prompt {text, send?}
  *   - parent only accepts messages where event.origin === embed origin AND
  *     payload.source === 'yeetful-embed'; parent→child posts always target
  *     the embed origin (never '*').
@@ -40,6 +40,13 @@ export interface YeetfulChatHandle {
   /** Update the wallet-address context (queued until the embed is ready). */
   setAddress(address: string | null): void
   setTheme(theme: 'dark' | 'light'): void
+  /**
+   * Inject a prompt into the chat — host CTAs like "ask about this order".
+   * Submits as the user's message by default; { submit: false } only prefills
+   * the input. Queued until the embed is ready. Bubble mode: open() first if
+   * you want the user to see the reply.
+   */
+  sendPrompt(text: string, opts?: { submit?: boolean }): void
   /** Bubble mode: open the panel (no-op inline). */
   open(): void
   /** Bubble mode: close the panel (no-op inline). */
@@ -242,6 +249,7 @@ export function mountYeetfulChat(opts: YeetfulChatOptions = {}): YeetfulChatHand
     iframe,
     setAddress: (address) => post({ type: 'address', address }),
     setTheme: (theme) => post({ type: 'theme', theme }),
+    sendPrompt: (text, promptOpts) => post({ type: 'prompt', text, send: promptOpts?.submit !== false }),
     open,
     close,
     destroy,
