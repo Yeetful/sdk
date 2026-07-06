@@ -17,6 +17,32 @@ function dispatch(origin: string, data: unknown) {
 
 const readyMsg = { source: 'yeetful-embed', v: 1, type: 'ready' }
 
+/** Flush pending microtasks/timers so async announcements land. */
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+const ACCOUNT = '0x3333333333333333333333333333333333333333'
+
+/** Fake EIP-1193 provider: vi.fn request + on/removeListener capture + emit. */
+function makeProvider() {
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>()
+  return {
+    request: vi.fn(async ({ method }: { method: string; params?: unknown[] }): Promise<unknown> => {
+      if (method === 'eth_accounts') return [ACCOUNT]
+      if (method === 'eth_chainId') return '0x2105'
+      return null
+    }),
+    on: vi.fn((event: string, fn: (...args: unknown[]) => void) => {
+      listeners.set(event, [...(listeners.get(event) ?? []), fn])
+    }),
+    removeListener: vi.fn((event: string, fn: (...args: unknown[]) => void) => {
+      listeners.set(event, (listeners.get(event) ?? []).filter((f) => f !== fn))
+    }),
+    emit(event: string, ...args: unknown[]) {
+      for (const fn of listeners.get(event) ?? []) fn(...args)
+    },
+  }
+}
+
 const handles: YeetfulChatHandle[] = []
 function mount(opts: Parameters<typeof mountYeetfulChat>[0]) {
   const h = mountYeetfulChat(opts)
@@ -181,6 +207,216 @@ describe('mountYeetfulChat', () => {
       h.open()
       h.close()
     }).not.toThrow()
+  })
+
+  describe('host-wallet bridge', () => {
+    const rpcMsg = (id: string, method: string, params?: unknown[]) => ({
+      source: 'yeetful-embed',
+      v: 1,
+      type: 'rpc',
+      id,
+      method,
+      ...(params ? { params } : {}),
+    })
+
+    it("announces the wallet after 'ready' with fetched accounts + chainId", async () => {
+      const provider = makeProvider()
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      expect(postMessage).not.toHaveBeenCalled()
+      dispatch(ORIGIN, readyMsg)
+      await flush()
+
+      expect(provider.request).toHaveBeenCalledWith({ method: 'eth_accounts' })
+      expect(provider.request).toHaveBeenCalledWith({ method: 'eth_chainId' })
+      expect(postMessage).toHaveBeenCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'wallet', accounts: [ACCOUNT], chainId: '0x2105' },
+        ORIGIN
+      )
+
+      // Iframe reload → a second 'ready' re-announces.
+      dispatch(ORIGIN, readyMsg)
+      await flush()
+      const walletPosts = postMessage.mock.calls.filter((c) => (c[0] as { type?: string }).type === 'wallet')
+      expect(walletPosts).toHaveLength(2)
+    })
+
+    it("wallet:'auto' (the default) picks up window.ethereum", async () => {
+      const provider = makeProvider()
+      ;(window as unknown as { ethereum?: unknown }).ethereum = provider
+      try {
+        const h = mount({ container: makeContainer() })
+        const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+        dispatch(ORIGIN, readyMsg)
+        await flush()
+        expect(postMessage).toHaveBeenCalledWith(
+          { source: 'yeetful-embed', v: 1, type: 'wallet', accounts: [ACCOUNT], chainId: '0x2105' },
+          ORIGIN
+        )
+        expect(provider.on).toHaveBeenCalledWith('accountsChanged', expect.any(Function))
+      } finally {
+        delete (window as unknown as { ethereum?: unknown }).ethereum
+      }
+    })
+
+    it('wallet:false disables the bridge — no announce, rpc → 4900', async () => {
+      const provider = makeProvider()
+      ;(window as unknown as { ethereum?: unknown }).ethereum = provider
+      try {
+        const h = mount({ container: makeContainer(), wallet: false })
+        const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+        dispatch(ORIGIN, readyMsg)
+        await flush()
+        expect(postMessage.mock.calls.filter((c) => (c[0] as { type?: string }).type === 'wallet')).toHaveLength(0)
+        expect(provider.request).not.toHaveBeenCalled()
+
+        dispatch(ORIGIN, rpcMsg('r1', 'eth_accounts'))
+        expect(postMessage).toHaveBeenLastCalledWith(
+          {
+            source: 'yeetful-embed',
+            v: 1,
+            type: 'rpc:error',
+            id: 'r1',
+            error: { code: 4900, message: 'no host wallet bridge' },
+          },
+          ORIGIN
+        )
+      } finally {
+        delete (window as unknown as { ethereum?: unknown }).ethereum
+      }
+    })
+
+    it('relays an allowlisted rpc with params and posts rpc:result to the embed origin', async () => {
+      const provider = makeProvider()
+      provider.request.mockResolvedValueOnce('0xde0b6b3a7640000')
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      dispatch(ORIGIN, rpcMsg('r2', 'eth_getBalance', [ACCOUNT, 'latest']))
+      await flush()
+
+      expect(provider.request).toHaveBeenCalledWith({ method: 'eth_getBalance', params: [ACCOUNT, 'latest'] })
+      expect(postMessage).toHaveBeenCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'rpc:result', id: 'r2', result: '0xde0b6b3a7640000' },
+        ORIGIN
+      )
+    })
+
+    it('refuses a disallowed method with 4200 without touching the provider', async () => {
+      const provider = makeProvider()
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      dispatch(ORIGIN, rpcMsg('r3', 'eth_sign', [ACCOUNT, '0xdead']))
+      await flush()
+
+      expect(provider.request).not.toHaveBeenCalled()
+      expect(postMessage).toHaveBeenCalledWith(
+        {
+          source: 'yeetful-embed',
+          v: 1,
+          type: 'rpc:error',
+          id: 'r3',
+          error: { code: 4200, message: 'eth_sign is not allowed by yeetful/embed' },
+        },
+        ORIGIN
+      )
+    })
+
+    it("surfaces a provider rejection as rpc:error with the provider's code", async () => {
+      const provider = makeProvider()
+      provider.request.mockRejectedValueOnce({ code: 4001, message: 'User rejected the request.' })
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      dispatch(ORIGIN, rpcMsg('r4', 'eth_sendTransaction', [{ to: ACCOUNT }]))
+      await flush()
+
+      expect(postMessage).toHaveBeenCalledWith(
+        {
+          source: 'yeetful-embed',
+          v: 1,
+          type: 'rpc:error',
+          id: 'r4',
+          error: { code: 4001, message: 'User rejected the request.' },
+        },
+        ORIGIN
+      )
+
+      // A codeless rejection falls back to -32603.
+      provider.request.mockRejectedValueOnce(new Error('boom'))
+      dispatch(ORIGIN, rpcMsg('r5', 'eth_chainId'))
+      await flush()
+      expect(postMessage).toHaveBeenLastCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'rpc:error', id: 'r5', error: { code: -32603, message: 'boom' } },
+        ORIGIN
+      )
+    })
+
+    it('re-announces on accountsChanged / chainChanged / disconnect', async () => {
+      const provider = makeProvider()
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      dispatch(ORIGIN, readyMsg)
+      await flush()
+
+      const next = '0x4444444444444444444444444444444444444444'
+      provider.emit('accountsChanged', [next])
+      expect(postMessage).toHaveBeenLastCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'wallet', accounts: [next], chainId: '0x2105' },
+        ORIGIN
+      )
+
+      provider.emit('chainChanged', '0x1')
+      expect(postMessage).toHaveBeenLastCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'wallet', accounts: [next], chainId: '0x1' },
+        ORIGIN
+      )
+
+      provider.emit('disconnect')
+      expect(postMessage).toHaveBeenLastCalledWith(
+        { source: 'yeetful-embed', v: 1, type: 'wallet', accounts: [], chainId: '0x1' },
+        ORIGIN
+      )
+    })
+
+    it('destroy removes the provider listeners', () => {
+      const provider = makeProvider()
+      const h = mount({ container: makeContainer(), wallet: provider })
+      expect(provider.on).toHaveBeenCalledTimes(3)
+
+      h.destroy()
+      for (const event of ['accountsChanged', 'chainChanged', 'disconnect']) {
+        const registered = provider.on.mock.calls.find((c) => c[0] === event)![1]
+        expect(provider.removeListener).toHaveBeenCalledWith(event, registered)
+      }
+    })
+
+    it('caps concurrent in-flight relays at 16 → -32005', async () => {
+      const provider = makeProvider()
+      provider.request.mockImplementation(() => new Promise(() => {})) // never settles
+      const h = mount({ container: makeContainer(), wallet: provider })
+      const postMessage = vi.spyOn(h.iframe.contentWindow!, 'postMessage')
+
+      for (let i = 0; i < 16; i++) dispatch(ORIGIN, rpcMsg(`q${i}`, 'eth_blockNumber'))
+      expect(provider.request).toHaveBeenCalledTimes(16)
+      expect(postMessage).not.toHaveBeenCalled() // all still pending
+
+      dispatch(ORIGIN, rpcMsg('q16', 'eth_blockNumber'))
+      expect(provider.request).toHaveBeenCalledTimes(16) // 17th never reaches the provider
+      expect(postMessage).toHaveBeenCalledWith(
+        {
+          source: 'yeetful-embed',
+          v: 1,
+          type: 'rpc:error',
+          id: 'q16',
+          error: { code: -32005, message: 'too many pending requests' },
+        },
+        ORIGIN
+      )
+    })
   })
 
   it('destroy removes DOM nodes and stops listening', () => {

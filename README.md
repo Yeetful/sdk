@@ -384,12 +384,26 @@ Plain script tag:
   const chat = mountYeetfulChat({
     container: '#yeetful-chat',        // element or selector (inline mode)
     mcps: ['uniswap-free'],            // scope the chat to these MCPs (≤4)
+    wallet: 'auto',                    // bridge window.ethereum into the chat (the default)
     theme: 'dark',
     onEvent: (name, data) => console.log('yeetful event', name, data),
   })
-  // later: chat.setAddress('0x…') · chat.destroy()
+  // later: chat.sendPrompt('…') · chat.destroy()
 </script>
 ```
+
+**The host-wallet bridge** (`wallet`, new in 0.9): the SDK relays the host
+page's EIP-1193 provider into the iframe over `postMessage`, so the embedded
+chat can request accounts, read balances, and pop the user's own wallet for
+signatures — no separate connect flow inside the embed. The host page already
+holds that provider, so the bridge grants the embed the same dapp-level access
+the host has, nothing more: every signature/transaction still opens the USER's
+wallet UI for approval, relayed reads are restricted to a strict method
+allowlist, and no private key material ever crosses the frame. `'auto'`
+(default) uses `window.ethereum` when present; pass a provider (e.g. from
+wagmi) or `false` to turn the bridge off. `setAddress` remains for
+context-only hosts that just want to tell the chat which address to talk
+about without wiring a wallet.
 
 React (e.g. a CoW Swap fork), mounting in a `useEffect` and syncing the
 connected account:
@@ -457,7 +471,7 @@ with an explicit `targetOrigin` (never `'*'`).
 
 ### `yeetful/embed`
 
-- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps.
+- `mountYeetfulChat(options)` — mounts the Yeetful chat iframe (inline or bubble); returns a `YeetfulChatHandle` (`setAddress` / `setTheme` / `sendPrompt` / `open` / `close` / `destroy`). Browser-only, zero deps. `options.wallet: 'auto' | Eip1193Provider | false` (default `'auto'`) bridges the host page's wallet provider into the chat — allowlisted EIP-1193 methods are relayed over `postMessage`; signatures/txs always pop the user's own wallet UI.
 
 ### Helpers
 
