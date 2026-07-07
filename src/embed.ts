@@ -5,7 +5,9 @@
  * any of the x402 payment stack — safe to load in host pages.
  *
  * Embed contract v1 (matches the website /embed route):
- *   - iframe URL: {origin}/embed?mcps=…&address=…&theme=…&host=…
+ *   - iframe URL: {origin}/embed?mcps=…&key=…&address=…&theme=…&host=…&page=…
+ *     (`key` = the PUBLIC yfe_ embed key; `page` = the full host page URL,
+ *     reported for the dashboard's "Your embeds" roster)
  *   - all postMessage payloads: { source: 'yeetful-embed', v: 1, type, ... }
  *   - child→parent: ready | resize {height} | event {name, data?}
  *   - parent→child: address {address} | theme {theme} | prompt {text, send?}
@@ -41,6 +43,14 @@ export interface YeetfulChatOptions {
   origin?: string
   /** MCP slugs to scope the chat to (max 4). */
   mcps?: string[]
+  /**
+   * PUBLIC embed key (`yfe_…`) from the Yeetful dashboard — publishable by
+   * design (safe in page source, like a Stripe publishable key). It
+   * attributes this embed to your account: the site appears under "Your
+   * embeds", and house-model answers meter YOUR plan's credits instead of
+   * each visitor's free tier. Omit for an unattributed embed.
+   */
+  key?: string
   /** Initial wallet-address context (goes in the URL). */
   address?: string
   /** Default 'dark'. */
@@ -151,9 +161,14 @@ export function mountYeetfulChat(opts: YeetfulChatOptions = {}): YeetfulChatHand
   const url = new URL('/embed', embedOrigin)
   const params = new URLSearchParams()
   if (opts.mcps?.length) params.set('mcps', opts.mcps.slice(0, 4).join(','))
+  if (opts.key) params.set('key', opts.key)
   if (opts.address) params.set('address', opts.address)
   params.set('theme', opts.theme ?? 'dark')
   params.set('host', window.location.origin)
+  // The full page URL feeds the dashboard's "Your embeds" roster (exactly
+  // which pages run the chat) — referrer policies usually trim cross-origin
+  // referrers to the origin, so the SDK reports it explicitly.
+  params.set('page', window.location.href)
   url.search = params.toString()
 
   // --- iframe ------------------------------------------------------------
