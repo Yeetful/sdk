@@ -76,14 +76,22 @@ describe('mountYeetfulChat', () => {
     expect(url.searchParams.get('address')).toBe('0x1111111111111111111111111111111111111111')
     expect(url.searchParams.get('theme')).toBe('light')
     expect(url.searchParams.get('host')).toBe(window.location.origin)
+    // the SDK always reports the full page URL for the embeds roster
+    expect(url.searchParams.get('page')).toBe(window.location.href)
   })
 
-  it('defaults theme to dark, omits mcps/address when unset, caps mcps at 4', () => {
+  it('passes the public embed key through as ?key=', () => {
+    const h = mount({ container: makeContainer(), key: 'yfe_0123456789abcdef01234567' })
+    expect(new URL(h.iframe.src).searchParams.get('key')).toBe('yfe_0123456789abcdef01234567')
+  })
+
+  it('defaults theme to dark, omits mcps/address/key when unset, caps mcps at 4', () => {
     const h = mount({ container: makeContainer() })
     const url = new URL(h.iframe.src)
     expect(url.searchParams.get('theme')).toBe('dark')
     expect(url.searchParams.has('mcps')).toBe(false)
     expect(url.searchParams.has('address')).toBe(false)
+    expect(url.searchParams.has('key')).toBe(false)
 
     const h2 = mount({ container: makeContainer(), mcps: ['a', 'b', 'c', 'd', 'e'] })
     expect(new URL(h2.iframe.src).searchParams.get('mcps')).toBe('a,b,c,d')
