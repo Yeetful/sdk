@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.1
+
+- **Fix: 402 bodies of `{}` no longer kill the payment flow.** Some x402 v2
+  servers (including @x402/next-based paid doors) put the full discovery
+  document base64-encoded in the `payment-required` response header and ship
+  a body of `{}`. `createPaymentClient` parsed the empty body as a valid
+  challenge, found zero `accepts`, and refused with "No acceptable payment
+  requirement matched client constraints". The client now falls back to the
+  header challenge whenever the body lacks a usable non-empty `accepts`
+  array — regardless of whether the body was valid JSON.
+
 ## 0.5.0
 
 - **New: org budgets — the two-level cap.** When the API key belongs to an
