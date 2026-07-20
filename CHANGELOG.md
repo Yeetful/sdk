@@ -11,6 +11,34 @@
   header challenge whenever the body lacks a usable non-empty `accepts`
   array — regardless of whether the body was valid JSON.
 
+## 0.10.0
+
+- **Embed: publishable embed keys.** `mountYeetfulChat({ key: 'yfe_…' })` —
+  the host pays visitors' house-inference credits; plus page-URL reporting
+  (`page=`) for per-site embed analytics.
+
+## 0.9.0
+
+- **Embed: host-wallet bridge.** `wallet: 'auto'` relays the host page's
+  EIP-1193 provider into the iframe over postMessage — visitors sign with
+  the wallet already connected to the host site.
+
+## 0.8.0
+
+- **New entry point: `yeetful/embed`.** `mountYeetfulChat()` drops the
+  Yeetful chat iframe into any page in five lines; `sendPrompt(text)` lets
+  the host inject prompts (contract `prompt` message).
+
+## 0.7.0
+
+- Export `USDC_DECIMALS`; fix the DTS/express build; richer JSDoc on utils.
+- Adopted the versioning rule: every shipped-code PR bumps `version`.
+
+## 0.6.0
+
+- **New: `reportUsage()`** (server) — earn-side receipt reporting so MCP
+  services can feed the two-sided dashboard.
+
 ## 0.5.0
 
 - **New: org budgets — the two-level cap.** When the API key belongs to an
