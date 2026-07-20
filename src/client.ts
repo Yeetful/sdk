@@ -95,21 +95,37 @@ export function requirementAtomicAmount(req: PaymentRequirement): bigint | null 
 }
 
 async function parsePaymentRequired(res: Response): Promise<PaymentRequiredResponse> {
+  let body: PaymentRequiredResponse | null = null
   try {
-    return (await res.clone().json()) as PaymentRequiredResponse
+    body = (await res.clone().json()) as PaymentRequiredResponse
   } catch {
-    // v2 servers mirror the discovery document base64-encoded in the
-    // `payment-required` response header — fall back to it for non-JSON bodies.
-    const header = res.headers.get('payment-required')
-    if (header) {
-      try {
-        return decodePayment<PaymentRequiredResponse>(header)
-      } catch {
-        /* fall through to the error below */
-      }
-    }
-    throw new PaymentError('402 response did not contain a valid x402 discovery body')
+    body = null
   }
+  if (hasUsableAccepts(body)) return body as PaymentRequiredResponse
+
+  // v2 servers mirror the discovery document base64-encoded in the
+  // `payment-required` response header. Fall back to it whenever the body
+  // lacks a usable `accepts` — some servers ship a body of `{}`, which is
+  // valid JSON but no challenge (the "parsed fine, zero requirements" trap).
+  const header = res.headers.get('payment-required')
+  if (header) {
+    try {
+      const decoded = decodePayment<PaymentRequiredResponse>(header)
+      if (hasUsableAccepts(decoded)) return decoded
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // A parsed-but-unusable body still beats a parse error downstream: the
+  // selector's "no requirement matched" carries the requirements for
+  // debugging, where this throw carries nothing.
+  if (body) return body
+  throw new PaymentError('402 response did not contain a valid x402 discovery body')
+}
+
+function hasUsableAccepts(value: PaymentRequiredResponse | null | undefined): boolean {
+  return !!value && Array.isArray(value.accepts) && value.accepts.length > 0
 }
 
 function selectRequirement(
